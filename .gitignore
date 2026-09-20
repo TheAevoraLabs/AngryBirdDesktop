@@ -1,0 +1,41 @@
+# Build and binary artifacts
+build/
+build-cmake/
+bin/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Game assets and data (proprietary game files)
+assets/
+save/
+angry-birds-classic-*/
+angry-birds-friends-*/
+*.zip
+*.apk
+*.dex
+decomp/
+decompiled_java/
+jadx-*/
+com.halfbrick.*/
+files/
+.freebuff/
+
+# Logs and temporary files
+*.log
+run.log
+*.tmp
+*.swp
+*~
+.DS_Store
+
+# IDE and tooling caches
+.vscode/
+.idea/
+.cache/
+.ccls-cache/
+compile_commands.json
