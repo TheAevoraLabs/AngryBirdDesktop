@@ -96,4 +96,8 @@ The output executable and supporting shims are placed in `bin/angrybirds_desktop
 
 ## License & Disclaimer
 
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)** - see the [LICENSE](LICENSE) file for details.
+
+Copyright (C) 2026 AevoraLabs / TheAevoraLabs.
+
 This repository contains only independent reverse-engineering tools, shims, and loader code. It does NOT contain copyrighted game assets, binaries, or proprietary libraries from Rovio Entertainment. All trademarks and copyrighted assets belong to their respective owners.
