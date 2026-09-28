@@ -1,347 +1,377 @@
-#include <SDL3/SDL.h>
-#include <SDL3/SDL_opengl.h>
-#include <dlfcn.h>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <errno.h>
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
-#include <sys/syscall.h>
+#include <stdint.h>
+#include <sys/stat.h>
 #include <sys/mman.h>
+#include <filesystem>
 #include <chrono>
 #include <thread>
-#include <filesystem>
 
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_opengl.h>
+#include <SDL3/SDL_opengles2.h>
+
+#include "loader/so_util.h"
+#include "jni/jni.h"
+#include "jni/jni_fake.h"
+#include "fusion/fusion.h"
+#include "audio/audio.h"
+#include "common/game_config.h"
+#include "common/util.h"
 #include "android/asset_manager.h"
 #include "android/log.h"
-#include "jni/jni_bridge.h"
-#include "audio/audio.h"
 
 namespace fs = std::filesystem;
 
-// Global native function pointers
-JNI_OnLoad_t g_JNI_OnLoad = nullptr;
-nativeConfig_t g_nativeConfig = nullptr;
-nativeGetPossibleOrientations_t g_nativeGetPossibleOrientations = nullptr;
-nativeInit_t g_nativeInit = nullptr;
-nativeDeinit_t g_nativeDeinit = nullptr;
-nativePause_t g_nativePause = nullptr;
-nativeResume_t g_nativeResume = nullptr;
-nativeResize_t g_nativeResize = nullptr;
-nativeUpdate_t g_nativeUpdate = nullptr;
-nativeRender_t g_nativeRender = nullptr;
-nativeFrameClear_t g_nativeFrameClear = nullptr;
-nativeInput_t g_nativeInput = nullptr;
-nativeKeyInput_t g_nativeKeyInput = nullptr;
-nativeMixData_t g_nativeMixData = nullptr;
+// Engine module instance
+static so_module g_game_mod;
 
-#include <exception>
-#include <typeinfo>
-#include <cxxabi.h>
+// Engine entry point prototypes
+typedef jint (*JNI_OnLoad_t)(JavaVM vm, void* reserved);
+typedef void (*nativeConfig_t)(JNIEnv env, jobject thiz, jstring path);
+typedef void (*nativeInit_t)(JNIEnv env, jobject thiz, jint width, jint height);
+typedef void (*nativeDeinit_t)(JNIEnv env, jobject thiz);
+typedef void (*nativePause_t)(JNIEnv env, jobject thiz);
+typedef void (*nativeResume_t)(JNIEnv env, jobject thiz);
+typedef void (*nativeResize_t)(JNIEnv env, jobject thiz, jint width, jint height);
+typedef void (*nativeUpdate_t)(JNIEnv env, jobject thiz);
+typedef void (*nativeRender_t)(JNIEnv env, jobject thiz);
+typedef void (*nativeInput_t)(JNIEnv env, jobject thiz, jint action, jint pointerId, jfloat x, jfloat y);
+typedef void (*nativeKeyInput_t)(JNIEnv env, jobject thiz, jint keycode, jint action);
 
-static void* load_native_library(const char* libpath) {
-    std::set_terminate([]() {
-        std::exception_ptr p = std::current_exception();
-        if (p) {
-            try {
-                std::rethrow_exception(p);
-            } catch (const std::exception& e) {
-                printf("[CRASH-DIAG] Uncaught std::exception: %s (type=%s)\n", e.what(), typeid(e).name());
-            } catch (...) {
-                const std::type_info* t = abi::__cxa_current_exception_type();
-                printf("[CRASH-DIAG] Uncaught non-std::exception (type=%s)\n", t ? t->name() : "unknown");
-            }
-        } else {
-            printf("[CRASH-DIAG] Terminate called with no active exception\n");
-        }
-        fflush(stdout);
-        abort();
-    });
+static JNI_OnLoad_t g_JNI_OnLoad = nullptr;
+static nativeConfig_t g_nativeConfig = nullptr;
+static nativeInit_t g_nativeInit = nullptr;
+static nativeDeinit_t g_nativeDeinit = nullptr;
+static nativePause_t g_nativePause = nullptr;
+static nativeResume_t g_nativeResume = nullptr;
+static nativeResize_t g_nativeResize = nullptr;
+static nativeUpdate_t g_nativeUpdate = nullptr;
+static nativeRender_t g_nativeRender = nullptr;
+static nativeInput_t g_nativeInput = nullptr;
+static nativeKeyInput_t g_nativeKeyInput = nullptr;
+static void* g_nativeMixData_addr = nullptr;
 
-    printf("[Loader] Loading %s ...\n", libpath);
-    void* handle = dlopen(libpath, RTLD_NOW | RTLD_GLOBAL);
-    if (!handle) {
-        printf("[Loader] Error loading %s: %s\n", libpath, dlerror());
-        return nullptr;
-    }
-    printf("[Loader] Successfully loaded %s\n", libpath);
-    return handle;
+// External Bionic symbols from bionic_shims.c
+extern "C" {
+    extern const short* _tolower_tab_;
+    extern const short* _toupper_tab_;
+    extern const char*  _ctype_;
+    extern FILE __sF[3];
+    extern void* memalign(size_t alignment, size_t size);
+    extern size_t malloc_usable_size(void* ptr);
+    extern ssize_t __read_chk(int fd, void *buf, size_t count, size_t buflen);
 }
 
-#include <link.h>
-#include <elf.h>
+static const so_default_dynlib g_bionic_dynlib[] = {
+    { "__android_log_print", (uintptr_t)__android_log_print },
+    { "__android_log_write", (uintptr_t)__android_log_write },
+    { "AAssetManager_fromJava", (uintptr_t)AAssetManager_fromJava },
+    { "AAssetManager_open", (uintptr_t)AAssetManager_open },
+    { "AAsset_close", (uintptr_t)AAsset_close },
+    { "AAsset_read", (uintptr_t)AAsset_read },
+    { "AAsset_seek", (uintptr_t)AAsset_seek },
+    { "AAsset_seek64", (uintptr_t)AAsset_seek64 },
+    { "AAsset_getLength", (uintptr_t)AAsset_getLength },
+    { "AAsset_getLength64", (uintptr_t)AAsset_getLength64 },
+    { "AAsset_getRemainingLength", (uintptr_t)AAsset_getRemainingLength },
+    { "AAsset_getRemainingLength64", (uintptr_t)AAsset_getRemainingLength64 },
+    { "AAsset_getBuffer", (uintptr_t)AAsset_getBuffer },
+    { "AAsset_isAllocated", (uintptr_t)AAsset_isAllocated },
+    { "AAsset_openFileDescriptor", (uintptr_t)AAsset_openFileDescriptor },
+    { "AAsset_openFileDescriptor64", (uintptr_t)AAsset_openFileDescriptor64 },
+    { "AAssetManager_openDir", (uintptr_t)AAssetManager_openDir },
+    { "AAssetDir_getNextFileName", (uintptr_t)AAssetDir_getNextFileName },
+    { "AAssetDir_rewind", (uintptr_t)AAssetDir_rewind },
+    { "AAssetDir_close", (uintptr_t)AAssetDir_close },
+    { "_ctype_", (uintptr_t)&_ctype_ },
+    { "_tolower_tab_", (uintptr_t)&_tolower_tab_ },
+    { "_toupper_tab_", (uintptr_t)&_toupper_tab_ },
+    { "__sF", (uintptr_t)&__sF },
+    { "memalign", (uintptr_t)memalign },
+    { "malloc_usable_size", (uintptr_t)malloc_usable_size },
+    { "__read_chk", (uintptr_t)__read_chk },
+};
+
+static bool resolve_engine_symbols(so_module* mod) {
+    g_JNI_OnLoad = (JNI_OnLoad_t)so_symbol(mod, "JNI_OnLoad");
+    g_nativeConfig = (nativeConfig_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeConfig");
+    g_nativeInit = (nativeInit_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeInit");
+    g_nativeDeinit = (nativeDeinit_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeDeinit");
+    g_nativePause = (nativePause_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativePause");
+    g_nativeResume = (nativeResume_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeResume");
+    g_nativeResize = (nativeResize_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeResize");
+    g_nativeUpdate = (nativeUpdate_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeUpdate");
+    g_nativeRender = (nativeRender_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeRender");
+    g_nativeInput = (nativeInput_t)so_symbol(mod, "Java_com_rovio_fusion_MyInputHandler_nativeInput");
+    g_nativeKeyInput = (nativeKeyInput_t)so_symbol(mod, "Java_com_rovio_fusion_MyInputHandler_nativeKeyInput");
+    g_nativeMixData_addr = (void*)so_symbol(mod, "Java_com_rovio_fusion_Audio_nativeMixData");
+
+    if (!g_nativeInit || !g_nativeUpdate) {
+        printf("[Error] Missing core symbols in game SO!\n");
+        return false;
+    }
+    return true;
+}
+
 #include <funchook.h>
 
-static uintptr_t g_lib_base = 0;
-static const Elf32_Phdr* g_lib_phdrs = nullptr;
-static int g_lib_phnum = 0;
-
-static int dl_callback(struct dl_phdr_info *info, size_t size, void *data) {
-    (void)size; (void)data;
-    if (info->dlpi_name && strstr(info->dlpi_name, "libAngryBirdsClassic.so")) {
-        g_lib_base = (uintptr_t)info->dlpi_addr;
-        g_lib_phdrs = info->dlpi_phdr;
-        g_lib_phnum = info->dlpi_phnum;
-    }
-    return 0;
-}
-
-// The game is compiled against Bionic headers, whose `struct sigaction` is
-// 16 bytes on 32-bit x86 instead of glibc's 140-byte layout. Calling glibc's
-// sigaction directly smashes the stack (kernel writes 140 bytes into the
-// 16-byte buffer). Redirect only the game's own GOT slots for sigaction /
-// sigprocmask to Bionic-ABI wrappers, leaving SDL3 and everything else on the
-// real glibc functions.
-extern "C" int rovio_sigaction_compat(int signum, const void* act, void* oldact);
-extern "C" int rovio_sigprocmask_compat(int how, const void* set, void* oldset);
-
-static void* find_dynamic_entry(const Elf32_Dyn* dyn, size_t n, Elf32_Sword tag) {
-    for (size_t i = 0; i < n; i++) {
-        if (dyn[i].d_tag == tag) return (void*)(uintptr_t)dyn[i].d_un.d_ptr;
-    }
-    return nullptr;
-}
-
-// Relocation r_offset values are virtual addresses relative to the library
-// base, so the in-memory GOT slot is simply base + r_offset.
-static uintptr_t file_offset_to_addr(uintptr_t off) {
-    return g_lib_base + off;
-}
-
-static void patch_got_symbol(const char* symname, void* replacement) {
-    if (!g_lib_base || !g_lib_phdrs) {
-        printf("[Hook] GOT patch: lib base/phdrs unavailable, skipping %s\n", symname);
-        return;
-    }
-
-    const Elf32_Phdr* pt_dyn = nullptr;
-    for (int i = 0; i < g_lib_phnum; i++) {
-        if (g_lib_phdrs[i].p_type == PT_DYNAMIC) {
-            pt_dyn = &g_lib_phdrs[i];
-            break;
-        }
-    }
-    if (!pt_dyn) {
-        printf("[Hook] GOT patch: no PT_DYNAMIC, skipping %s\n", symname);
-        return;
-    }
-
-    const Elf32_Dyn* dyn = (const Elf32_Dyn*)(g_lib_base + pt_dyn->p_vaddr);
-    size_t dyn_n = pt_dyn->p_filesz / sizeof(Elf32_Dyn);
-
-    Elf32_Rel* jmprel = (Elf32_Rel*)find_dynamic_entry(dyn, dyn_n, DT_JMPREL);
-    size_t jmprelsz = (size_t)find_dynamic_entry(dyn, dyn_n, DT_PLTRELSZ);
-    Elf32_Rel* rel = (Elf32_Rel*)find_dynamic_entry(dyn, dyn_n, DT_REL);
-    size_t relsz = (size_t)find_dynamic_entry(dyn, dyn_n, DT_RELSZ);
-    Elf32_Sym* symtab = (Elf32_Sym*)find_dynamic_entry(dyn, dyn_n, DT_SYMTAB);
-    const char* strtab = (const char*)find_dynamic_entry(dyn, dyn_n, DT_STRTAB);
-    if (!symtab || !strtab) {
-        printf("[Hook] GOT patch: no symtab/strtab, skipping %s\n", symname);
-        return;
-    }
-
-    auto scan = [&](Elf32_Rel* r, size_t sz) {
-        size_t n = sz / sizeof(Elf32_Rel);
-        for (size_t i = 0; i < n; i++) {
-            int type = ELF32_R_TYPE(r[i].r_info);
-            if (type != R_386_JMP_SLOT && type != R_386_GLOB_DAT) continue;
-            unsigned symidx = ELF32_R_SYM(r[i].r_info);
-            if (symidx == 0) continue;
-            const char* name = strtab + symtab[symidx].st_name;
-            if (strcmp(name, symname) != 0) continue;
-            uintptr_t got_addr = file_offset_to_addr(r[i].r_offset);
-            printf("[Hook] Redirecting %s GOT slot at 0x%lx to %p\n",
-                   symname, (unsigned long)got_addr, replacement);
-            // Defensive: the page could be made read-only by RELRO.
-            uintptr_t page = got_addr & ~(uintptr_t)0xFFF;
-            if (mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE) != 0) {
-                printf("[Hook] Warning: mprotect failed for GOT page 0x%lx: %s\n",
-                       (unsigned long)page, strerror(errno));
-            }
-            *(void**)got_addr = replacement;
-        }
-    };
-
-    if (jmprel && jmprelsz) scan(jmprel, jmprelsz);
-    if (rel && relsz) scan(rel, relsz);
-}
-
-typedef int (*lua_pcall_t)(void* L, int nargs, int nresults, int errfunc);
-typedef const char* (*lua_tolstring_t)(void* L, int idx, size_t* len);
-typedef int (*lua_load_t)(void* L, void* reader, void* data, const char* chunkname);
+// Lua hooks and error handling
+typedef int (*lua_pcall_t)(void *L, int nargs, int nresults, int errfunc);
+typedef const char* (*lua_tolstring_t)(void *L, int idx, size_t *len);
+typedef int (*is_drawing_ready_t)(void* obj);
 
 static lua_pcall_t g_orig_lua_pcall = nullptr;
 static lua_tolstring_t g_lua_tolstring = nullptr;
+static is_drawing_ready_t g_orig_is_drawing_ready = nullptr;
+
+static int my_lua_pcall(void *L, int nargs, int nresults, int errfunc) {
+    int res = g_orig_lua_pcall(L, nargs, nresults, errfunc);
+    if (res != 0) {
+        const char *err = g_lua_tolstring ? g_lua_tolstring(L, -1, nullptr) : "(no tolstring)";
+        printf("[Lua] Error in lua_pcall: %d -> %s\n", res, err ? err : "(null)");
+
+        // Walk Lua CallInfo stack
+        if (L) {
+            uint8_t *state = (uint8_t*)L;
+            uint8_t *ci = *(uint8_t**)(state + 0x14); // L->ci
+            uint8_t *base_ci = *(uint8_t**)(state + 0x28); // L->base_ci (approx)
+            printf("[Lua Traceback]:\n");
+            int frame = 0;
+            while (ci && frame < 30) {
+                uint8_t *func_tv = *(uint8_t**)(ci + 0x4); // ci->func
+                if (!func_tv) break;
+                uint32_t tt = *(uint32_t*)(func_tv + 4);
+                if (tt == 6) { // LUA_TFUNCTION
+                    uint8_t *cl = *(uint8_t**)(func_tv + 0);
+                    if (cl) {
+                        uint8_t isC = cl[7];
+                        if (!isC) {
+                            uint8_t *proto = *(uint8_t**)(cl + 8);
+                            if (proto) {
+                                uint8_t *src_str = *(uint8_t**)(proto + 8);
+                                const char *src = src_str ? (const char*)(src_str + 0x10) : "(unknown)";
+                                int linedefined = *(int*)(proto + 0xc);
+                                printf("  #%d [Lua] %s (line defined: %d)\n", frame, src, linedefined);
+                            }
+                        } else {
+                            printf("  #%d [C/C++ func %p]\n", frame, *(void**)(cl + 8));
+                        }
+                    }
+                }
+                // Previous CallInfo in array is (ci - 0x18)
+                ci = ci - 0x18;
+                frame++;
+            }
+        }
+        fflush(stdout);
+    }
+    return res;
+}
+
+typedef int (*lua_load_t)(void *L, void *reader, void *data, const char *chunkname);
 static lua_load_t g_orig_lua_load = nullptr;
 
-static int my_lua_pcall(void* L, int nargs, int nresults, int errfunc) {
-    int res = g_orig_lua_pcall(L, nargs, nresults, errfunc);
-    if (res != 0 && g_lua_tolstring) {
-        const char* err = g_lua_tolstring(L, -1, nullptr);
-        printf("[LUA-PCALL-FAILED] (code=%d, nargs=%d, nres=%d, errfunc=%d):\n%s\n",
-               res, nargs, nresults, errfunc, err ? err : "unknown");
-        fflush(stdout);
-    }
-    return res;
-}
-
-static int my_lua_load(void* L, void* reader, void* data, const char* chunkname) {
-    printf("[LUA-LOAD] chunk: %s\n", chunkname ? chunkname : "(null)");
+static int my_lua_load(void *L, void *reader, void *data, const char *chunkname) {
+    printf("[Lua] Loading chunk: %s\n", chunkname ? chunkname : "(null)");
     fflush(stdout);
-    int res = g_orig_lua_load(L, reader, data, chunkname);
-    if (res != 0) {
-        printf("[LUA-LOAD-FAILED] chunk: %s, code=%d\n", chunkname ? chunkname : "(null)", res);
-        fflush(stdout);
-    }
-    return res;
+    return g_orig_lua_load(L, reader, data, chunkname);
 }
 
-// sub_3E862: void sub_3E862(lua_State* L, int errcode, const char* msg)
-// This function wraps a Lua error into a C++ LuaException and throws it.
-// On desktop we cannot handle uncaught C++ exceptions from the engine's Lua
-// behavior system, so we hook this to just log and return silently.
-typedef void (*lua_throw_error_t)(void* L, int errcode, const char* msg);
-static lua_throw_error_t g_orig_lua_throw_error = nullptr;
+typedef void (*luaG_runerror_t)(void *L, const char *fmt, ...);
+static luaG_runerror_t g_orig_luaG_runerror = nullptr;
 
-static void my_lua_throw_error(void* L, int errcode, const char* msg) {
-    printf("[Hook] Suppressed LuaException throw (code=%d): %s\n",
-           errcode, msg ? msg : "(null)");
+static void my_luaG_runerror(void *L, const char *fmt, ...) {
+    char buf[1024] = {0};
+    va_list va;
+    va_start(va, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, va);
+    va_end(va);
+
+    const char *source = "(unknown)";
+    int line = 0;
+    if (L) {
+        uint8_t *state = (uint8_t*)L;
+        uint8_t *ci = *(uint8_t**)(state + 0x14); // L->ci
+        if (ci) {
+            uint8_t *func_tv = *(uint8_t**)(ci + 0x4); // ci->func
+            if (func_tv && *(uint32_t*)(func_tv + 4) == 6) { // LUA_TFUNCTION
+                uint8_t *cl = *(uint8_t**)(func_tv + 0);
+                if (cl && cl[6] == 0) { // isC == 0
+                    uint8_t *proto = *(uint8_t**)(cl + 0x10);
+                    if (proto) {
+                        uint8_t *src_obj = *(uint8_t**)(proto + 0x20); // Proto->source
+                        if (src_obj) source = (const char*)(src_obj + 0x10);
+                        uint32_t *code = *(uint32_t**)(proto + 0xc);
+                        int *lineinfo = *(int**)(proto + 0x14);
+                        uint32_t *savedpc = *(uint32_t**)(state + 0x18);
+                        if (code && lineinfo && savedpc && savedpc > code) {
+                            int pc = (int)(savedpc - code) - 1;
+                            line = lineinfo[pc];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    printf("[Lua Panic] in %s:%d: %s\n", source, line, buf);
     fflush(stdout);
-    (void)L;
+    g_orig_luaG_runerror(L, "%s", buf);
 }
 
-typedef void (*glDrawArrays_t)(GLenum mode, GLint first, GLsizei count);
-typedef void (*glDrawElements_t)(GLenum mode, GLsizei count, GLenum type, const void* indices);
-typedef ssize_t (*read_t)(int fd, void* buf, size_t count);
-
-static glDrawArrays_t g_orig_glDrawArrays = nullptr;
-static glDrawElements_t g_orig_glDrawElements = nullptr;
-static read_t g_orig_read = nullptr;
-static uint64_t g_draw_call_count = 0;
-
-static void my_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
-    g_draw_call_count++;
-    if (g_orig_glDrawArrays) g_orig_glDrawArrays(mode, first, count);
+static int my_is_drawing_ready(void* obj) {
+    if (!obj) return 0;
+    return 1;
 }
 
-static void my_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
-    g_draw_call_count++;
-    if (g_orig_glDrawElements) g_orig_glDrawElements(mode, count, type, indices);
+static void setup_vfs_bundle_routing(so_module* mod) {
+    if (!mod || !mod->base) return;
+
+    uint8_t *stub = (uint8_t *)mmap(
+        NULL, 4096,
+        PROT_READ | PROT_WRITE | PROT_EXEC,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0
+    );
+    if (stub == MAP_FAILED) return;
+
+    uint8_t *p = stub;
+    // 8b bd d8 fd ff ff        mov    -0x228(%ebp),%edi
+    *p++ = 0x8b; *p++ = 0xbd; *p++ = 0xd8; *p++ = 0xfd; *p++ = 0xff; *p++ = 0xff;
+    // c7 07 05 00 00 00        movl   $0x5,(%edi)
+    *p++ = 0xc7; *p++ = 0x07; *p++ = 0x05; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+    // 8b 85 dc fd ff ff        mov    -0x224(%ebp),%eax
+    *p++ = 0x8b; *p++ = 0x85; *p++ = 0xdc; *p++ = 0xfd; *p++ = 0xff; *p++ = 0xff;
+    // 89 44 24 04              mov    %eax,0x4(%esp)
+    *p++ = 0x89; *p++ = 0x44; *p++ = 0x24; *p++ = 0x04;
+    // 8d 47 04                 lea    0x4(%edi),%eax
+    *p++ = 0x8d; *p++ = 0x47; *p++ = 0x04;
+    // 89 04 24                 mov    %eax,(%esp)
+    *p++ = 0x89; *p++ = 0x04; *p++ = 0x24;
+
+    // e8 xx xx xx xx           call   (mod->base + 0x9ec020)
+    *p++ = 0xe8;
+    int32_t rel_call = (int32_t)((mod->base + 0x9ec020) - (p + 4));
+    memcpy(p, &rel_call, 4);
+    p += 4;
+
+    // e9 xx xx xx xx           jmp    (mod->base + 0x756d0f)
+    *p++ = 0xe9;
+    int32_t rel_jmp = (int32_t)((mod->base + 0x756d0f) - (p + 4));
+    memcpy(p, &rel_jmp, 4);
+    p += 4;
+
+    auto hook_jmp6 = [](uint8_t *src, uint8_t *dst) {
+        src[0] = 0xe9;
+        int32_t rel = (int32_t)(dst - (src + 5));
+        memcpy(src + 1, &rel, 4);
+        src[5] = 0x90;
+    };
+
+    hook_jmp6(mod->base + 0x756e97, stub);
+    hook_jmp6(mod->base + 0x756f1c, stub);
+    hook_jmp6(mod->base + 0x756f5a, stub);
+
+    // Also patch 0x756f8b (7 bytes) -> jmp stub
+    uint8_t *p_throw = mod->base + 0x756f8b;
+    p_throw[0] = 0xe9;
+    int32_t rel_throw = (int32_t)(stub - (p_throw + 5));
+    memcpy(p_throw + 1, &rel_throw, 4);
+    p_throw[5] = 0x90;
+    p_throw[6] = 0x90;
+
+    printf("[Hook] In-memory VFS bundle routing installed (stub at %p)\n", stub);
 }
 
-static ssize_t my_read(int fd, void* buf, size_t count) {
-    if (fd == 0) {
-        return 0; // EOF on stdin so engine CLI / console never hangs
+typedef void (*image_reader_create_t)(void *out_reader, void **stream, int format);
+static image_reader_create_t g_orig_image_reader_create = nullptr;
+
+static void my_image_reader_create(void *out_reader, void **stream, int format) {
+    printf("[ImageReader] create reader: out=%p, stream=%p, format=%d\n", out_reader, stream ? *stream : nullptr, format);
+    fflush(stdout);
+    g_orig_image_reader_create(out_reader, stream, format);
+}
+
+typedef int (*detect_format_t)(void *stream);
+static detect_format_t g_orig_detect_format = nullptr;
+
+typedef int (*stream_read_t)(void *stream, void *buf, size_t size);
+typedef int (*stream_tell_t)(void *stream);
+typedef void (*stream_seek_t)(void *stream, int pos, int origin, int u);
+
+static int my_detect_format(void *stream) {
+    int fmt = g_orig_detect_format(stream);
+    if (fmt == 0 && stream) {
+        void **vtable = *(void***)stream;
+        if (vtable && vtable[2] && vtable[4] && vtable[5]) {
+            stream_tell_t tell_fn = (stream_tell_t)vtable[5];
+            stream_seek_t seek_fn = (stream_seek_t)vtable[4];
+            stream_read_t read_fn = (stream_read_t)vtable[2];
+            int old_pos = tell_fn(stream);
+            seek_fn(stream, 0, 0, 0);
+            uint32_t magic = 0;
+            read_fn(stream, &magic, 4);
+            seek_fn(stream, old_pos, 0, 0);
+
+            if (magic == 0x03525650 || magic == 0x21505652) {
+                fmt = 11; // PVR
+            } else if (magic == 0x474e5089) {
+                fmt = 6;  // PNG
+            } else if ((magic & 0xffff) == 0xd8ff) {
+                fmt = 3;  // JPG
+            } else if ((magic & 0xffff) == 0x4d42) {
+                fmt = 1;  // BMP
+            }
+            printf("[ImageReader] stream %p: auto-detected magic 0x%08x -> format %d\n", stream, magic, fmt);
+        }
     }
-    if (g_orig_read) {
-        return g_orig_read(fd, buf, count);
-    }
-    return syscall(SYS_read, fd, buf, count);
+    printf("[ImageReader] detect_format -> format=%d\n", fmt);
+    fflush(stdout);
+    return fmt;
 }
 
-static void install_hooks() {
-    dl_iterate_phdr(dl_callback, nullptr);
-    if (!g_lib_base) {
-        printf("[Hook] libAngryBirdsClassic.so base not found!\n");
-        return;
-    }
-    printf("[Hook] libAngryBirdsClassic.so base: 0x%lx\n", (unsigned long)g_lib_base);
+static void install_runtime_hooks(so_module* mod) {
+    if (!mod || !mod->base) return;
 
-    g_orig_lua_pcall = (lua_pcall_t)(g_lib_base + 0x8d66f0);
-    g_lua_tolstring = (lua_tolstring_t)(g_lib_base + 0x8d49f0);
-    g_orig_lua_load = (lua_load_t)(g_lib_base + 0x8d6850);
-    // Redirect the game's sigaction/sigprocmask GOT slots to Bionic-ABI
-    // wrappers BEFORE any game code runs (nativeInit installs signal handlers).
-    patch_got_symbol("sigaction", (void*)rovio_sigaction_compat);
-    patch_got_symbol("sigprocmask", (void*)rovio_sigprocmask_compat);
-
-    g_orig_lua_throw_error = (lua_throw_error_t)(g_lib_base + 0x3e862);
-    g_orig_read = (read_t)dlsym(RTLD_DEFAULT, "read");
-    g_orig_glDrawArrays = (glDrawArrays_t)dlsym(RTLD_DEFAULT, "glDrawArrays");
-    g_orig_glDrawElements = (glDrawElements_t)dlsym(RTLD_DEFAULT, "glDrawElements");
+    g_orig_lua_pcall = (lua_pcall_t)(mod->base + 0x8d66f0);
+    g_lua_tolstring = (lua_tolstring_t)(mod->base + 0x8d49f0);
+    g_orig_lua_load = (lua_load_t)(mod->base + 0x8d68d0);
+    g_orig_luaG_runerror = (luaG_runerror_t)(mod->base + 0x8c7160);
+    g_orig_is_drawing_ready = (is_drawing_ready_t)(mod->base + 0x2176a0);
+    g_orig_image_reader_create = (image_reader_create_t)(mod->base + 0x70fa00);
+    g_orig_detect_format = (detect_format_t)(mod->base + 0x74b160);
 
     funchook_t *funchook = funchook_create();
     if (funchook) {
         funchook_prepare(funchook, (void**)&g_orig_lua_pcall, (void*)my_lua_pcall);
         funchook_prepare(funchook, (void**)&g_orig_lua_load, (void*)my_lua_load);
-        funchook_prepare(funchook, (void**)&g_orig_lua_throw_error, (void*)my_lua_throw_error);
-        if (g_orig_read) funchook_prepare(funchook, (void**)&g_orig_read, (void*)my_read);
-        if (g_orig_glDrawArrays) funchook_prepare(funchook, (void**)&g_orig_glDrawArrays, (void*)my_glDrawArrays);
-        if (g_orig_glDrawElements) funchook_prepare(funchook, (void**)&g_orig_glDrawElements, (void*)my_glDrawElements);
+        funchook_prepare(funchook, (void**)&g_orig_luaG_runerror, (void*)my_luaG_runerror);
+        funchook_prepare(funchook, (void**)&g_orig_is_drawing_ready, (void*)my_is_drawing_ready);
+        funchook_prepare(funchook, (void**)&g_orig_image_reader_create, (void*)my_image_reader_create);
+        funchook_prepare(funchook, (void**)&g_orig_detect_format, (void*)my_detect_format);
         int rv = funchook_install(funchook, 0);
-        printf("[Hook] funchook_install result: %d\n", rv);
-        printf("[Hook]   lua_pcall    -> %p\n", (void*)g_orig_lua_pcall);
-        printf("[Hook]   lua_load     -> %p\n", (void*)g_orig_lua_load);
-        printf("[Hook]   lua_throw    -> %p\n", (void*)g_orig_lua_throw_error);
-        printf("[Hook]   read         -> %p\n", (void*)g_orig_read);
+        printf("[Hook] In-memory funchook installed (result: %d)\n", rv);
     }
-}
 
-static bool resolve_symbols(void* handle) {
-    if (!handle) return false;
-
-    #define RESOLVE(name, type) \
-        g_##name = (type)dlsym(handle, "Java_com_rovio_fusion_NativeApplication_" #name); \
-        if (!g_##name) { \
-            g_##name = (type)dlsym(handle, #name); \
-        } \
-        printf("[Loader] Symbol %s: %p\n", #name, (void*)g_##name);
-
-    g_JNI_OnLoad = (JNI_OnLoad_t)dlsym(handle, "JNI_OnLoad");
-    RESOLVE(nativeConfig, nativeConfig_t);
-    RESOLVE(nativeGetPossibleOrientations, nativeGetPossibleOrientations_t);
-    RESOLVE(nativeInit, nativeInit_t);
-    RESOLVE(nativeDeinit, nativeDeinit_t);
-    RESOLVE(nativePause, nativePause_t);
-    RESOLVE(nativeResume, nativeResume_t);
-    RESOLVE(nativeResize, nativeResize_t);
-    RESOLVE(nativeUpdate, nativeUpdate_t);
-    RESOLVE(nativeRender, nativeRender_t);
-    RESOLVE(nativeFrameClear, nativeFrameClear_t);
-
-    g_nativeInput = (nativeInput_t)dlsym(handle, "Java_com_rovio_fusion_MyInputHandler_nativeInput");
-    g_nativeKeyInput = (nativeKeyInput_t)dlsym(handle, "Java_com_rovio_fusion_MyInputHandler_nativeKeyInput");
-    g_nativeMixData = (nativeMixData_t)dlsym(handle, "Java_com_rovio_fusion_AudioOutput_nativeMixData");
-    g_onVideoEnded = (onVideoEnded_t)dlsym(handle, "Java_com_rovio_fusion_VideoPlayerBridge_onVideoEnded");
-
-    printf("[Loader] Symbol nativeInput: %p\n", (void*)g_nativeInput);
-    printf("[Loader] Symbol nativeKeyInput: %p\n", (void*)g_nativeKeyInput);
-    printf("[Loader] Symbol nativeMixData: %p\n", (void*)g_nativeMixData);
-    printf("[Loader] Symbol onVideoEnded: %p\n", (void*)g_onVideoEnded);
-
-    install_hooks();
-
-    return (g_nativeInit && g_nativeUpdate && g_nativeRender);
+    setup_vfs_bundle_routing(mod);
 }
 
 int main(int argc, char* argv[]) {
-    // Ensure LD_LIBRARY_PATH includes bin and 32-bit library directories
-    const char* cur_ld = getenv("LD_LIBRARY_PATH");
-    const char* reexec_marker = getenv("__AB_REEXEC");
-    if (!reexec_marker) {
-        std::string new_ld = "bin:../bin:angry-birds-classic-8-0-3/lib/x86";
-        if (cur_ld) {
-            new_ld += ":";
-            new_ld += cur_ld;
-        }
-        setenv("LD_LIBRARY_PATH", new_ld.c_str(), 1);
-        setenv("__AB_REEXEC", "1", 1);
-        printf("[Bootstrap] Setting LD_LIBRARY_PATH=%s and launching...\n", new_ld.c_str());
-        fflush(stdout);
-        execv("/proc/self/exe", argv);
-    }
-
-    setvbuf(stdout, NULL, _IONBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
+    (void)argc;
+    (void)argv;
 
     printf("=========================================\n");
-    printf("       Angry Birds Desktop (x86)        \n");
+    printf("   Angry Birds Desktop (In-Memory x86)   \n");
     printf("=========================================\n");
 
-    // 1. Ensure save and assets directory exist
+    // 1. Filesystem & directories
     fs::create_directories("save");
-    
-    // Set base path for AAssetManager
+    fs::create_directories("save/cache");
+    config_load_defaults();
+
     if (fs::exists("assets")) {
         AAssetManager_setBasePath("assets");
     } else if (fs::exists("../assets")) {
@@ -356,7 +386,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Request OpenGL ES 2.0 compatible context
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
@@ -364,19 +393,10 @@ int main(int argc, char* argv[]) {
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
-    // The window manager on some desktops sends spurious close requests while
-    // the engine is busy loading (long synchronous Lua loads), and SDL3 by
-    // default turns an unhandled close request into SDL_EVENT_QUIT. The game
-    // owns its own lifecycle, so ignore WM close pokes; ESC still exits.
-    SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
-
-    int window_width = 1280;
-    int window_height = 720;
-
     SDL_Window* window = SDL_CreateWindow(
         "Angry Birds Classic",
-        window_width,
-        window_height,
+        screen_width,
+        screen_height,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE
     );
 
@@ -396,92 +416,98 @@ int main(int argc, char* argv[]) {
 
     SDL_GL_SetSwapInterval(1); // Enable VSync
 
-    // 3. Initialize Audio
-    audio_init(44100, 2);
+    // 3. Initialize Fake JNI Environment
+    jni_init();
+    void* thiz = jni_make_thiz();
 
-    // 4. Initialize JNI Bridge
-    jni_bridge_init();
-
-    // Preload Android and Bionic shims
-    const char* preloads[] = {
-        "bin/libc.so", "/lib/libc.so.6",
-        "bin/libm.so", "/lib/libm.so.6",
-        "bin/libstdc++.so", "/usr/lib/libstdc++.so.6",
-        "bin/liblog.so", "./liblog.so", "liblog.so",
-        "bin/libandroid.so", "./libandroid.so", "libandroid.so",
-        "bin/libjs.so", "./libjs.so"
-    };
-    for (const char* p : preloads) {
-        if (fs::exists(p)) {
-            dlopen(p, RTLD_NOW | RTLD_GLOBAL);
-        }
-    }
-
-    // 5. Load Native Library
-    const char* libpaths[] = {
+    // 4. In-Memory ELF Loading (Unmodified libAngryBirdsClassic.so)
+    const char* lib_paths[] = {
         "bin/libAngryBirdsClassic.so",
-        "./libAngryBirdsClassic.so",
         "angry-birds-classic-8-0-3/lib/x86/libAngryBirdsClassic.so",
+        "./libAngryBirdsClassic.so",
         "../bin/libAngryBirdsClassic.so"
     };
 
-    void* lib_handle = nullptr;
-    for (const char* path : libpaths) {
-        if (fs::exists(path)) {
-            lib_handle = load_native_library(path);
-            if (lib_handle) break;
+    const char* selected_path = nullptr;
+    for (const char* p : lib_paths) {
+        if (fs::exists(p)) {
+            selected_path = p;
+            break;
         }
     }
 
-    if (!lib_handle) {
-        printf("[Error] Could not load libAngryBirdsClassic.so from any searched path.\n");
+    if (!selected_path) {
+        printf("[Error] Could not find libAngryBirdsClassic.so!\n");
         SDL_GL_DestroyContext(gl_context);
         SDL_DestroyWindow(window);
         SDL_Quit();
         return 1;
     }
 
-    if (!resolve_symbols(lib_handle)) {
-        printf("[Error] Failed to resolve required native symbols!\n");
+    printf("[Loader] Loading in-memory ELF from %s...\n", selected_path);
+    if (so_load(&g_game_mod, selected_path) != 0) {
+        printf("[Error] Failed to parse and map ELF module!\n");
         SDL_GL_DestroyContext(gl_context);
         SDL_DestroyWindow(window);
         SDL_Quit();
         return 1;
     }
 
-    JNIEnv* env = jni_get_env();
-    JavaVM* vm = jni_get_java_vm();
+    printf("[Loader] Applying internal relocations...\n");
+    so_relocate(&g_game_mod);
 
-    // 6. JNI OnLoad
+    printf("[Loader] Resolving dynamic imports...\n");
+    so_resolve(&g_game_mod, g_bionic_dynlib, sizeof(g_bionic_dynlib) / sizeof(g_bionic_dynlib[0]));
+
+    printf("[Loader] Running static initializers (.init_array)...\n");
+    so_initialize(&g_game_mod);
+
+    if (!resolve_engine_symbols(&g_game_mod)) {
+        printf("[Error] Failed to resolve required engine symbols!\n");
+        so_free(&g_game_mod);
+        SDL_GL_DestroyContext(gl_context);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+
+    install_runtime_hooks(&g_game_mod);
+
+    // 5. Register Audio Mixer
+    if (g_nativeMixData_addr) {
+        audio_set_mixer(g_nativeMixData_addr, thiz);
+    }
+
+    // 6. JNI OnLoad & Native Configuration
     if (g_JNI_OnLoad) {
         printf("[Game] Calling JNI_OnLoad...\n");
-        g_JNI_OnLoad(vm, nullptr);
+        g_JNI_OnLoad(fake_vm, nullptr);
     }
 
-    // 7. Configure and Initialize Engine
     if (g_nativeConfig) {
         printf("[Game] Calling nativeConfig...\n");
-        jstring cfg = env->NewStringUTF("./save");
-        g_nativeConfig(env, nullptr, cfg);
+        jstring cfg_path = jni_make_string("./save");
+        g_nativeConfig(fake_env, thiz, cfg_path);
     }
 
-    printf("[Game] Initializing engine with resolution %dx%d...\n", window_width, window_height);
-    fflush(stdout);
+    printf("[Game] Initializing engine with resolution %dx%d...\n", screen_width, screen_height);
     if (g_nativeInit) {
-        g_nativeInit(env, nullptr, window_width, window_height);
+        g_nativeInit(fake_env, thiz, screen_width, screen_height);
     }
     printf("[Game] nativeInit completed successfully!\n");
-    fflush(stdout);
+
+    if (g_nativeResize) {
+        printf("[Game] Resizing engine viewport to %dx%d...\n", screen_width, screen_height);
+        g_nativeResize(fake_env, thiz, screen_width, screen_height);
+    }
 
     if (g_nativeResume) {
         printf("[Game] Resuming native application...\n");
-        fflush(stdout);
-        g_nativeResume(env, nullptr);
+        g_nativeResume(fake_env, thiz);
         printf("[Game] nativeResume completed successfully!\n");
-        fflush(stdout);
     }
 
-    // 8. Main Application Loop
+    // 7. Main Application Loop
     bool running = true;
     bool mouse_down = false;
     SDL_Event event;
@@ -490,44 +516,25 @@ int main(int argc, char* argv[]) {
     printf("[Game] Entering main render loop...\n");
     fflush(stdout);
 
-    while (running) {
+    while (running && !jni_quit_requested) {
         uint64_t start_time = SDL_GetTicks();
 
         // Poll Events
         while (SDL_PollEvent(&event)) {
-            if (event.type != SDL_EVENT_MOUSE_MOTION) {
-                printf("[Event] type=%d ts=%llu win=%u data1=%d data2=%d\n", (int)event.type,
-                       (unsigned long long)event.common.timestamp,
-                       (unsigned int)event.window.windowID,
-                       event.window.data1, event.window.data2);
-                fflush(stdout);
-            }
             switch (event.type) {
-                case SDL_EVENT_QUIT: {
+                case SDL_EVENT_QUIT:
                     printf("[Game] Received SDL_EVENT_QUIT\n");
-                    const char* sdl_err = SDL_GetError();
-                    printf("[Game] SDL_GetError: %s\n", sdl_err ? sdl_err : "(null)");
-                    const unsigned char* raw = (const unsigned char*)&event;
-                    printf("[Game] raw event: ");
-                    for (int i = 0; i < 24; i++) printf("%02x ", raw[i]);
-                    printf("\n");
-                    fflush(stdout);
                     running = false;
-                    break;
-                }
-
-                case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-                    printf("[Game] WM close requested (ignored; press ESC to exit)\n");
                     break;
 
                 case SDL_EVENT_WINDOW_RESIZED: {
                     int new_w = event.window.data1;
                     int new_h = event.window.data2;
                     if (new_w > 0 && new_h > 0) {
-                        window_width = new_w;
-                        window_height = new_h;
+                        screen_width = new_w;
+                        screen_height = new_h;
                         if (g_nativeResize) {
-                            g_nativeResize(env, nullptr, new_w, new_h);
+                            g_nativeResize(fake_env, thiz, new_w, new_h);
                         }
                     }
                     break;
@@ -539,7 +546,7 @@ int main(int argc, char* argv[]) {
                         float x = event.button.x;
                         float y = event.button.y;
                         if (g_nativeInput) {
-                            g_nativeInput(env, nullptr, 0 /* ACTION_DOWN */, x, y, 0);
+                            g_nativeInput(fake_env, thiz, 0 /* ACTION_DOWN */, 0, x, y);
                         }
                     }
                     break;
@@ -551,7 +558,7 @@ int main(int argc, char* argv[]) {
                         float x = event.button.x;
                         float y = event.button.y;
                         if (g_nativeInput) {
-                            g_nativeInput(env, nullptr, 1 /* ACTION_UP */, x, y, 0);
+                            g_nativeInput(fake_env, thiz, 1 /* ACTION_UP */, 0, x, y);
                         }
                     }
                     break;
@@ -562,7 +569,7 @@ int main(int argc, char* argv[]) {
                         float x = event.motion.x;
                         float y = event.motion.y;
                         if (g_nativeInput) {
-                            g_nativeInput(env, nullptr, 2 /* ACTION_MOVE */, x, y, 0);
+                            g_nativeInput(fake_env, thiz, 2 /* ACTION_MOVE */, 0, x, y);
                         }
                     }
                     break;
@@ -573,16 +580,6 @@ int main(int argc, char* argv[]) {
                         printf("[Game] ESC pressed, exiting...\n");
                         running = false;
                     }
-                    if (g_nativeKeyInput) {
-                        g_nativeKeyInput(env, nullptr, event.key.key, 0, 0 /* ACTION_DOWN */, 0);
-                    }
-                    break;
-                }
-
-                case SDL_EVENT_KEY_UP: {
-                    if (g_nativeKeyInput) {
-                        g_nativeKeyInput(env, nullptr, event.key.key, 0, 1 /* ACTION_UP */, 0);
-                    }
                     break;
                 }
 
@@ -591,49 +588,51 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Tick Audio
-        audio_tick();
+        // Poll & Queue Audio
+        audio_poll();
 
-        // Tick Game Logic
+        // Game Logic & Frame Rendering (Fusion engine renders inside nativeUpdate)
         if (g_nativeUpdate) {
-            g_nativeUpdate(env, nullptr);
+            g_nativeUpdate(fake_env, thiz);
         }
 
-        // Render Frame
         if (g_nativeRender) {
-            g_nativeRender(env, nullptr);
+            g_nativeRender(fake_env, thiz);
         }
 
-        // Swap OpenGL Buffer
+        // Present OpenGL frame
         SDL_GL_SwapWindow(window);
 
         frame_count++;
         if (frame_count <= 20 || frame_count % 30 == 0) {
-            printf("[Game] Rendered %llu frames (draw calls: %llu)\n",
-                   (unsigned long long)frame_count, (unsigned long long)g_draw_call_count);
+            printf("[Game] Rendered frame %lu\n", (unsigned long)frame_count);
             fflush(stdout);
         }
 
-        // Maintain ~60 FPS
+        // Cap to ~60 FPS
         uint64_t elapsed = SDL_GetTicks() - start_time;
         if (elapsed < 16) {
             SDL_Delay(16 - elapsed);
         }
     }
 
-    printf("[Game] Shutting down...\n");
+    printf("[Game] Exiting application cleanly...\n");
+
     if (g_nativePause) {
-        g_nativePause(env, nullptr);
+        g_nativePause(fake_env, thiz);
     }
+
     if (g_nativeDeinit) {
-        g_nativeDeinit(env, nullptr);
+        g_nativeDeinit(fake_env, thiz);
     }
 
     audio_shutdown();
+    so_free(&g_game_mod);
+
     SDL_GL_DestroyContext(gl_context);
     SDL_DestroyWindow(window);
     SDL_Quit();
 
-    printf("[Game] Clean exit.\n");
+    printf("[Game] Application terminated cleanly.\n");
     return 0;
 }

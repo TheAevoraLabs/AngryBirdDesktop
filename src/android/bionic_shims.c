@@ -346,13 +346,13 @@ int fdatasync(int fd) {
 }
 
 // 6. Ctype tables for Bionic
-static short g_tolower_tab[257];
-static short g_toupper_tab[257];
-static char  g_ctype_tab[257];
+static short g_tolower_tab[384];
+static short g_toupper_tab[384];
+static char  g_ctype_tab[384];
 
-const short* _tolower_tab_ = &g_tolower_tab[1];
-const short* _toupper_tab_ = &g_toupper_tab[1];
-const char*  _ctype_ = &g_ctype_tab[1];
+const short* _tolower_tab_ = &g_tolower_tab[0];
+const short* _toupper_tab_ = &g_toupper_tab[0];
+const char*  _ctype_ = &g_ctype_tab[0];
 
 // 7. __sF (Bionic stdin, stdout, stderr)
 FILE __sF[3];
@@ -375,8 +375,8 @@ static void init_bionic_tables(void) {
         if (isspace(i)) flags |= 0x08; // _S
         if (ispunct(i)) flags |= 0x10; // _P
         if (iscntrl(i)) flags |= 0x20; // _C
-        if (isblank(i)) flags |= 0x40; // _B
-        if (isxdigit(i)) flags |= 0x80; // _X
+        if (isxdigit(i)) flags |= 0x40; // _X (Bionic: 0x40)
+        if (isblank(i)) flags |= 0x80; // _B (Bionic: 0x80)
         g_ctype_tab[i + 1] = flags;
     }
 

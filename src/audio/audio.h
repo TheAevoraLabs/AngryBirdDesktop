@@ -1,20 +1,16 @@
-#ifndef ANGRYBIRDS_AUDIO_H
-#define ANGRYBIRDS_AUDIO_H
-
-#include <stdint.h>
-#include <stdbool.h>
+#ifndef AUDIO_H
+#define AUDIO_H
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-bool audio_init(int sampleRate, int channels);
-void audio_shutdown();
-void audio_set_mix_context(int64_t context);
-void audio_tick();
+void audio_set_mixer(void *native_mix_data_addr, void *thiz);
+void audio_poll(void);
+void audio_shutdown(void);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // ANGRYBIRDS_AUDIO_H
+#endif // AUDIO_H

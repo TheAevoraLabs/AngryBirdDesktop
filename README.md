@@ -10,24 +10,34 @@ By reconstructing the required Android Bionic C runtime interfaces, standard JNI
 
 ## Current Project Status
 
-- **Status**: Work in Progress / Proof of Concept
-- **Boot State**: Experimental; does not boot into a fully playable state out-of-the-box. The loader successfully passes ELF linkage, loads native engine components, establishes the JNI environment, initializes shaders, compiles Lua scripts, initializes audio output, and enters the frame rendering loop, but gameplay transition remains incomplete.
+- **Status**: Bootable & Rendering / Active Development
+- **Boot State**: Fully boots unmodified Android x86 `libAngryBirdsClassic.so` in-memory. The engine completes ELF loading, dynamic symbol resolution, static C++ initialization, JNI setup, GLES2 shader compilation, PVR texture decoding, VFS URI routing, and Lua environment bootstrapping (classes, behaviors, UI hierarchy), actively executing the main application render loop and drawing frames via OpenGL ES 2.0.
+- **Binary Integrity**: Zero binary modification or on-disk patching of `libAngryBirdsClassic.so`. All platform adaptations and relocations are handled in-memory.
 
 ## Architecture and Components
 
-### 1. Host Loader (`src/main.cpp`)
-- Handles process bootstrap, 32-bit multilib runtime configuration, and dynamic linker interaction.
-- Creates SDL3 display windows, configures OpenGL ES 2.0 contexts, manages VSync swap intervals, and captures input events (mouse, keyboard, window resize).
-- Invokes native lifecycle entry points: `JNI_OnLoad`, `nativeConfig`, `nativeInit`, `nativeResume`, `nativeUpdate`, `nativeRender`, and `nativeInput`.
+### 1. In-Memory ELF Loader (`src/loader/`)
+- Custom ELF parser and loader mapping unmodified 32-bit x86 Android shared libraries directly from disk into memory.
+- Handles `PT_LOAD` segment mapping with exact page permissions (`PROT_READ`, `PROT_WRITE`, `PROT_EXEC`).
+- Resolves ELF dynamic relocations (`R_386_RELATIVE`, `R_386_GLOB_DAT`, `R_386_JMP_SLOT`, `R_386_32`).
+- Registers `.eh_frame` / `.eh_frame_hdr` sections dynamically with both internal and host unwinders (`__register_frame`), preventing C++ exception aborts across module boundaries.
+- Executes `DT_INIT_ARRAY` constructors in order.
 
-### 2. Android Bionic & POSIX Shims (`src/android/`)
+### 2. Host Bootstrap & Engine Lifecycle (`src/main.cpp`)
+- Creates SDL display window, configures OpenGL ES 2.0 context, manages VSync swap intervals, and captures mouse/keyboard input.
+- Drives the Rovio Fusion lifecycle: `JNI_OnLoad` -> `nativeConfig` -> `nativeInit` -> `nativeResize` -> `nativeResume` -> per-frame `nativeUpdate`.
+- Features in-memory VFS routing stubs (`VirtualFileSystem::parseUri`) ensuring level bundle assets resolve to `Scheme::VFS`.
+- Runtime image format detection hook (`detect_format`) identifying PVRv3 texture streams (`0x03525650` / `0x21505652`).
+
+### 3. Android Bionic & POSIX Shims (`src/android/`)
 - **Memory Allocation (`bionic_shims.c`)**: Custom mmap-backed memory allocator (`memalign`, `malloc`, `free`, `realloc`) bypassing glibc 32-bit `sbrk`/top-chunk arena restrictions.
 - **Synchronization**: Futex-based lightweight `pthread_mutex` and `pthread_cond` implementations compatible with Bionic expectations.
+- **Ctype & Character Classification**: Accurate Android Bionic `_ctype_`, `_tolower_tab_`, and `_toupper_tab_` table shims matching Bionic's `_X`/`_B` bitmasks and pointer-offset expectations for Lua pattern matching.
 - **Asset Manager (`asset_manager.c`)**: Emulation of Android `AAssetManager_*` APIs reading directory hierarchies directly from local filesystem paths.
 - **Non-Blocking I/O Stubs**: Overrides for `read`/`__read_chk` on standard input descriptors (`STDIN_FILENO`) preventing engine debug consoles from blocking the main execution thread.
 - **Logging Subsystem (`log.c`)**: Standardized `__android_log_print` redirection to stdout/stderr.
 
-### 3. JNI Bridge (`src/jni/`)
+### 4. JNI Bridge (`src/jni/`)
 - Complete emulation of `JNIEnv` and `JavaVM` function tables.
 - Synthetic class/method metadata dispatch for Android framework classes, including:
   - `com.rovio.fusion.Globals` (activity handles, cache paths, screen density, metrics)
@@ -37,11 +47,11 @@ By reconstructing the required Android Bionic C runtime interfaces, standard JNI
   - `android.content.Context`, `android.content.res.AssetManager`
   - Java core utilities (`java.util.Locale`, `java.util.UUID`, `java.util.HashMap`, `java.util.List`)
 
-### 4. Audio Subsystem (`src/audio/`)
+### 5. Audio Subsystem (`src/audio/`)
 - Native PCM audio stream consumer utilizing SDL3 audio device callbacks.
 - Interfaces with the Rovio engine's native mixer routine (`nativeMixData`).
 
-### 5. Interception & Runtime Hooks (`funchook`)
+### 6. Interception & Runtime Hooks (`funchook`)
 - Integrated dynamic function hooking via `funchook` and `distorm`:
   - `lua_pcall` / `lua_load` tracing and bytecode error inspection.
   - C++ exception suppression on internal engine Lua failure paths (`sub_3E862`).

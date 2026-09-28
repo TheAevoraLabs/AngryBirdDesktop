@@ -29,10 +29,16 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/android
     ${CMAKE_SOURCE_DIR}/src/jni
+    ${CMAKE_SOURCE_DIR}/src/fusion
+    ${CMAKE_SOURCE_DIR}/src/loader
+    ${CMAKE_SOURCE_DIR}/src/common
+    ${CMAKE_SOURCE_DIR}/src/patches
     ${CMAKE_SOURCE_DIR}/src/audio
     ${CMAKE_SOURCE_DIR}/funchook-1.1.3/include
 )
 
+set(FUNCHOOK_CPU "x86" CACHE STRING "" FORCE)
+set(FUNCHOOK_DISASM "distorm" CACHE STRING "" FORCE)
 set(FUNCHOOK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(FUNCHOOK_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(FUNCHOOK_INSTALL OFF CACHE BOOL "" FORCE)
@@ -41,14 +47,23 @@ add_subdirectory(funchook-1.1.3)
 find_library(SDL3_LIB NAMES SDL3 PATHS /usr/lib /usr/lib/i386-linux-gnu /usr/lib/i686-linux-gnu NO_DEFAULT_PATH)
 find_library(GL_LIB NAMES GL OpenGL PATHS /usr/lib /usr/lib/i386-linux-gnu /usr/lib/i686-linux-gnu NO_DEFAULT_PATH)
 
-# Build Android shims as shared libraries to satisfy libAngryBirdsClassic.so DT_NEEDED
+# Build Android shims
 add_library(log SHARED src/android/log.c)
 add_library(android SHARED src/android/asset_manager.c src/android/bionic_shims.c)
 
 set(SOURCES
     src/main.cpp
+    src/loader/so_util.c
+    src/fusion/fusion.c
+    src/jni/jni_fake.c
+    src/common/game_config.c
+    src/patches/patch_bytecode.c
+    src/patches/sprite_patch.c
+    src/patches/powerup_patch.c
+    src/patches/aes.c
     src/android/bionic_shims.c
-    src/jni/jni_bridge.cpp
+    src/android/asset_manager.c
+    src/android/log.c
     src/audio/audio.cpp
 )
 
@@ -59,17 +74,6 @@ set_target_properties(angrybirds_desktop PROPERTIES
     BUILD_RPATH "$ORIGIN:$ORIGIN/../bin:/usr/lib:/lib"
     INSTALL_RPATH "$ORIGIN:$ORIGIN/../bin:/usr/lib:/lib"
     BUILD_WITH_INSTALL_RPATH TRUE
-)
-
-# Automatic symlinks for Android DT_NEEDED names (libc.so, libm.so, libstdc++.so)
-add_custom_command(TARGET angrybirds_desktop POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E create_symlink /lib/libc.so.6 ${CMAKE_BINARY_DIR}/../bin/libc.so
-    COMMAND ${CMAKE_COMMAND} -E create_symlink /lib/libm.so.6 ${CMAKE_BINARY_DIR}/../bin/libm.so
-    COMMAND ${CMAKE_COMMAND} -E create_symlink /usr/lib/libstdc++.so.6 ${CMAKE_BINARY_DIR}/../bin/libstdc++.so
-    COMMAND ${CMAKE_COMMAND} -E create_symlink /lib/libc.so.6 ${CMAKE_BINARY_DIR}/../bin/libdl.so
-    COMMAND ${CMAKE_COMMAND} -E create_symlink /usr/lib/libGLESv2.so.2 ${CMAKE_BINARY_DIR}/../bin/libGLESv2.so
-    COMMAND ${CMAKE_COMMAND} -E create_symlink /usr/lib/libEGL.so.1 ${CMAKE_BINARY_DIR}/../bin/libEGL.so
-    COMMENT "Generating 32-bit Bionic DT_NEEDED symlinks in bin/"
 )
 
 target_link_libraries(angrybirds_desktop PRIVATE
@@ -98,27 +102,19 @@ target_link_libraries(angrybirds_desktop PRIVATE
 
 # ---------------------------------------------------------------------------
 # angryrift — Angry Birds Classic encrypted-lua decoder ("Angry Rift").
-# Role model: filerift in SwordigoDesktop (decode/recode + smoke test).
-# Standalone: src/angryrift/{angryrift.h,angryaes.h,angryrift.cpp} is a
-# header+single-TU library with NO game dependencies (only liblzma + libc).
-# NOTE: 32-bit (-m32) liblzma is not installed here, so the angryrift CLI is
-# intentionally NOT part of the -m32 build; build it explicitly 64-bit:
-#   g++ -std=c++17 -I src src/angryrift/angryrift.cpp \
-#       src/angryrift/angryrift_cli.cpp -llzma -o bin/angryrift
 # ---------------------------------------------------------------------------
-find_package(PkgConfig QUIET)
-if (PkgConfig_FOUND)
-    pkg_check_modules(LZMA QUIET liblzma)
-endif()
-if (LZMA_FOUND)
-    add_library(angryrift STATIC src/angryrift/angryrift.cpp)
-    target_include_directories(angryrift PUBLIC ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(angryrift PUBLIC ${LZMA_LIBRARIES})
-    target_include_directories(angryrift PUBLIC ${LZMA_INCLUDE_DIRS})
-    add_executable(angryrift_cli src/angryrift/angryrift_cli.cpp)
-    target_link_libraries(angryrift_cli PRIVATE angryrift)
-    set_target_properties(angryrift_cli PROPERTIES OUTPUT_NAME angryrift)
-else()
-    message(STATUS "angryrift: liblzma not found via pkg-config; "
-                   "CLI target skipped (see comment above for manual build)")
+if (NOT ARCH_FLAGS MATCHES "-m32")
+    find_package(PkgConfig QUIET)
+    if (PkgConfig_FOUND)
+        pkg_check_modules(LZMA QUIET liblzma)
+    endif()
+    if (LZMA_FOUND)
+        add_library(angryrift STATIC src/angryrift/angryrift.cpp)
+        target_include_directories(angryrift PUBLIC ${CMAKE_SOURCE_DIR}/src)
+        target_link_libraries(angryrift PUBLIC ${LZMA_LIBRARIES})
+        target_include_directories(angryrift PUBLIC ${LZMA_INCLUDE_DIRS})
+        add_executable(angryrift_cli src/angryrift/angryrift_cli.cpp)
+        target_link_libraries(angryrift_cli PRIVATE angryrift)
+        set_target_properties(angryrift_cli PROPERTIES OUTPUT_NAME angryrift)
+    endif()
 endif()

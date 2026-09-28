@@ -39,3 +39,7 @@ run.log
 .cache/
 .ccls-cache/
 compile_commands.json
+__pycache__/
+angrybirdsclassic_nx-main/
+swordigo-vita-master/
+*.luac
