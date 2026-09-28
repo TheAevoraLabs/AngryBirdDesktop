@@ -11,6 +11,8 @@
 #include <unistd.h>
 #include <dlfcn.h>
 
+#include "stdio_compat.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -355,7 +357,11 @@ const short* _toupper_tab_ = &g_toupper_tab[0];
 const char*  _ctype_ = &g_ctype_tab[0];
 
 // 7. __sF (Bionic stdin, stdout, stderr)
-FILE __sF[3];
+//
+// Laid out with BIONIC's element size, not the host's -- the engine indexes this
+// array itself (`stderr` == `&__sF[2]` == `__sF + 168`), so a glibc-sized stride
+// would put our slots where the engine never looks. See stdio_compat.h.
+ab_bionic_file __sF[3];
 
 __attribute__((constructor))
 static void init_bionic_tables(void) {
@@ -380,9 +386,19 @@ static void init_bionic_tables(void) {
         g_ctype_tab[i + 1] = flags;
     }
 
-    if (stdin)  memcpy(&__sF[0], stdin, sizeof(FILE));
-    if (stdout) memcpy(&__sF[1], stdout, sizeof(FILE));
-    if (stderr) memcpy(&__sF[2], stderr, sizeof(FILE));
+    /* __sF is deliberately left as opaque, zeroed storage.
+     *
+     * It used to be seeded with a memcpy() of the host's stdin/stdout/stderr, so
+     * that an unwrapped __sF slot would at least look like a FILE. That was
+     * worse than useless: the copy is not a real glibc stream (its internal
+     * pointers and buffers belong to the original object), so the moment the
+     * engine handed &__sF[1] to the host's fwrite(), glibc dereferenced a field
+     * of the copy and faulted -- which is exactly how Angry Birds Friends died
+     * inside nativeInit.
+     *
+     * The three slots now exist purely as address tokens, and every stdio entry
+     * point that accepts a FILE* is routed through stdio_compat.c, which swaps a
+     * token for the genuine host stream. See stdio_compat.h. */
 }
 
 #include <sys/syscall.h>

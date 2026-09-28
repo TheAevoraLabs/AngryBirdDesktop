@@ -40,6 +40,7 @@
 #include "patches/iap_patch.h"
 #include "common/game_config.h"
 #include "common/util.h"
+#include "android/asset_manager.h"
 
 // negotiated audio format (defaults are the Fusion norm; corrected on the real
 // createAudioOutput call)
@@ -301,6 +302,44 @@ jvalue fusion_call(const char *cls, const char *method, const char *sig,
   if (IS("isTablet")) { r.z = JNI_TRUE; return r; }
   if (IS("hasNotch")) { r.z = JNI_FALSE; return r; }
   if (IS("quitRequested")) { return r; }
+
+  // -------- FileReader: the asset reads Friends routes through Java --------
+  // com.rovio.fusion.FileReader.readFile(String path) -> byte[]
+  //
+  // Classic reads its assets through the engine's own VirtualFileSystem (which
+  // main.cpp nudges onto the VFS scheme); Friends asks the Java layer to read
+  // the file instead. Without this, the very first shader load fails with
+  // "Failed to open data/shaders/gles2/2d-sprite-alpha-masked.fx" and the
+  // engine abandons nativeInit -- which is exactly where the first bring-up run
+  // stopped.
+  if (IS("readFile")) {
+    void *path_obj = NULL;
+    int64_t iv = 0; double dv = 0; void *pv = NULL;
+    const char *p = sig_args(sig);
+    while (*p && *p != ')') {
+      char k = read_arg(&p, ap, &iv, &dv, &pv);
+      if (k == 'l' && !path_obj) path_obj = pv;
+    }
+    const char *path = path_obj ? jni_obj_string(path_obj) : NULL;
+    if (path && *path) {
+      AAsset *a = AAssetManager_open(NULL, path, AASSET_MODE_BUFFER);
+      if (a) {
+        const void *buf = AAsset_getBuffer(a);
+        int64_t len = AAsset_getLength(a);
+        if (buf && len > 0) r.l = jni_wrap_bytearray((void *)buf, (int)len);
+        /* AAsset_close() deliberately leaves the buffer mapped -- the asset
+         * manager's documented contract -- so the array the engine now holds
+         * stays valid for as long as it wants it. */
+        AAsset_close(a);
+        debugPrintf("[FileReader] readFile(\"%s\") -> %lld byte(s)\n", path, (long long)len);
+      } else {
+        debugPrintf("[FileReader] readFile(\"%s\") -> NOT FOUND\n", path);
+      }
+    } else {
+      debugPrintf("[FileReader] readFile(<null path>) -> null\n");
+    }
+    return r;   /* r.l stays 0 when nothing was read, which is Java's null */
+  }
 
   // -------- everything else: log once-ish and return 0/null --------
   {

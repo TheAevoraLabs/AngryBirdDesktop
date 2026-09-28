@@ -55,7 +55,13 @@ add_library(log SHARED src/android/log.c)
 add_library(android SHARED src/android/asset_manager.c src/android/bionic_shims.c)
 
 set(SOURCES
+    # --- entry point + one driver per supported title ---
+    src/main_dispatch.cpp
     src/main.cpp
+    src/main_friends.cpp
+    # --- shared host support ---
+    src/common/game_profile.c
+    src/common/bionic_dynlib.cpp
     src/loader/so_util.c
     src/fusion/fusion.c
     src/jni/jni_fake.c
@@ -67,6 +73,7 @@ set(SOURCES
     src/patches/iap_patch.c
     src/patches/aes.c
     src/android/bionic_shims.c
+    src/android/stdio_compat.c
     src/android/asset_manager.c
     src/android/log.c
     src/audio/audio.cpp

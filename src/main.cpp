@@ -29,6 +29,9 @@
 #include "patches/iap_patch.h"
 #include "common/game_config.h"
 #include "common/util.h"
+#include "common/game_profile.h"
+#include "common/bionic_dynlib.h"
+#include "main_games.h"
 #include "android/asset_manager.h"
 #include "android/log.h"
 
@@ -76,75 +79,31 @@ static nativeKeyInput_t g_nativeKeyInput = nullptr;
 static nativeInputAxis_t g_nativeInputAxis = nullptr;
 static void* g_nativeMixData_addr = nullptr;
 
-// External Bionic symbols from bionic_shims.c
-extern "C" {
-    extern const short* _tolower_tab_;
-    extern const short* _toupper_tab_;
-    extern const char*  _ctype_;
-    extern FILE __sF[3];
-    extern void* memalign(size_t alignment, size_t size);
-    extern size_t malloc_usable_size(void* ptr);
-    extern ssize_t __read_chk(int fd, void *buf, size_t count, size_t buflen);
-
-    // Bionic's LP32 `struct sigaction` is 16 bytes (its sigset_t is one word),
-    // glibc's is 140. The engine allocates the Bionic-sized struct on its stack
-    // and hands the address to sigaction(), so calling glibc's directly walks
-    // ~124 bytes past the end of that stack slot. These wrappers convert the
-    // layouts; they are deliberately not named `sigaction`/`sigprocmask` so the
-    // host libraries keep calling the real ones.
-    struct bionic_sigaction;
-    extern int rovio_sigaction_compat(int signum, const struct bionic_sigaction* act, struct bionic_sigaction* oldact);
-    extern int rovio_sigprocmask_compat(int how, const unsigned long* set, unsigned long* oldset);
+/* Resolve one profile entry point: explicit offset first (stripped builds),
+ * exported name otherwise. NULL/empty symbols simply resolve to 0. */
+static uintptr_t entry_sym(so_module* mod, const ab_entry* e) {
+    if (!mod || !e) return 0;
+    if (e->offset) return (uintptr_t)(mod->base + e->offset);
+    if (!e->symbol) return 0;
+    return so_symbol(mod, e->symbol);
 }
 
-static const so_default_dynlib g_bionic_dynlib[] = {
-    { "__android_log_print", (uintptr_t)__android_log_print },
-    { "__android_log_write", (uintptr_t)__android_log_write },
-    { "AAssetManager_fromJava", (uintptr_t)AAssetManager_fromJava },
-    { "AAssetManager_open", (uintptr_t)AAssetManager_open },
-    { "AAsset_close", (uintptr_t)AAsset_close },
-    { "AAsset_read", (uintptr_t)AAsset_read },
-    { "AAsset_seek", (uintptr_t)AAsset_seek },
-    { "AAsset_seek64", (uintptr_t)AAsset_seek64 },
-    { "AAsset_getLength", (uintptr_t)AAsset_getLength },
-    { "AAsset_getLength64", (uintptr_t)AAsset_getLength64 },
-    { "AAsset_getRemainingLength", (uintptr_t)AAsset_getRemainingLength },
-    { "AAsset_getRemainingLength64", (uintptr_t)AAsset_getRemainingLength64 },
-    { "AAsset_getBuffer", (uintptr_t)AAsset_getBuffer },
-    { "AAsset_isAllocated", (uintptr_t)AAsset_isAllocated },
-    { "AAsset_openFileDescriptor", (uintptr_t)AAsset_openFileDescriptor },
-    { "AAsset_openFileDescriptor64", (uintptr_t)AAsset_openFileDescriptor64 },
-    { "AAssetManager_openDir", (uintptr_t)AAssetManager_openDir },
-    { "AAssetDir_getNextFileName", (uintptr_t)AAssetDir_getNextFileName },
-    { "AAssetDir_rewind", (uintptr_t)AAssetDir_rewind },
-    { "AAssetDir_close", (uintptr_t)AAssetDir_close },
-    { "_ctype_", (uintptr_t)&_ctype_ },
-    { "_tolower_tab_", (uintptr_t)&_tolower_tab_ },
-    { "_toupper_tab_", (uintptr_t)&_toupper_tab_ },
-    { "__sF", (uintptr_t)&__sF },
-    { "memalign", (uintptr_t)memalign },
-    { "malloc_usable_size", (uintptr_t)malloc_usable_size },
-    { "__read_chk", (uintptr_t)__read_chk },
-    { "sigaction", (uintptr_t)rovio_sigaction_compat },
-    { "sigprocmask", (uintptr_t)rovio_sigprocmask_compat },
-};
-
-static bool resolve_engine_symbols(so_module* mod) {
-    g_JNI_OnLoad = (JNI_OnLoad_t)so_symbol(mod, "JNI_OnLoad");
-    g_nativeConfig = (nativeConfig_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeConfig");
-    g_nativeInit = (nativeInit_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeInit");
-    g_nativeDeinit = (nativeDeinit_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeDeinit");
-    g_nativePause = (nativePause_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativePause");
-    g_nativeResume = (nativeResume_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeResume");
-    g_nativeResize = (nativeResize_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeResize");
-    g_nativeUpdate = (nativeUpdate_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeUpdate");
-    g_nativeRender = (nativeRender_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeRender");
-    g_nativeInput = (nativeInput_t)so_symbol(mod, "Java_com_rovio_fusion_MyInputHandler_nativeInput");
-    g_nativeKeyInput = (nativeKeyInput_t)so_symbol(mod, "Java_com_rovio_fusion_MyInputHandler_nativeKeyInput");
-    g_nativeInputAxis = (nativeInputAxis_t)so_symbol(mod, "Java_com_rovio_fusion_MyInputHandler_nativeInputAxis");
+static bool resolve_engine_symbols(so_module* mod, const ab_game_profile* prof) {
+    g_JNI_OnLoad = (JNI_OnLoad_t)entry_sym(mod, &prof->jni_on_load);
+    g_nativeConfig = (nativeConfig_t)entry_sym(mod, &prof->config);
+    g_nativeInit = (nativeInit_t)entry_sym(mod, &prof->init);
+    g_nativeDeinit = (nativeDeinit_t)entry_sym(mod, &prof->deinit);
+    g_nativePause = (nativePause_t)entry_sym(mod, &prof->pause);
+    g_nativeResume = (nativeResume_t)entry_sym(mod, &prof->resume);
+    g_nativeResize = (nativeResize_t)entry_sym(mod, &prof->resize);
+    g_nativeUpdate = (nativeUpdate_t)entry_sym(mod, &prof->update);
+    g_nativeRender = (nativeRender_t)entry_sym(mod, &prof->render);
+    g_nativeInput = (nativeInput_t)entry_sym(mod, &prof->input);
+    g_nativeKeyInput = (nativeKeyInput_t)entry_sym(mod, &prof->key_input);
+    g_nativeInputAxis = (nativeInputAxis_t)entry_sym(mod, &prof->input_axis);
     // The exported mixer lives on AudioOutput, not on an "Audio" class: see
     // `nm -D libAngryBirdsClassic.so | grep nativeMixData`.
-    g_nativeMixData_addr = (void*)so_symbol(mod, "Java_com_rovio_fusion_AudioOutput_nativeMixData");
+    g_nativeMixData_addr = (void*)entry_sym(mod, &prof->mix_data);
     if (!g_nativeMixData_addr)
         g_nativeMixData_addr = (void*)so_symbol(mod, "Java_com_rovio_fusion_Audio_nativeMixData");
 
@@ -386,54 +345,47 @@ static int my_detect_format(void *stream) {
     return fmt;
 }
 
-static void install_runtime_hooks(so_module* mod) {
+static void install_runtime_hooks(so_module* mod, const ab_game_profile* prof) {
     if (!mod || !mod->base) return;
 
-    g_orig_lua_pcall = (lua_pcall_t)(mod->base + 0x8d66f0);
-    g_lua_tolstring = (lua_tolstring_t)(mod->base + 0x8d49f0);
-    g_orig_lua_load = (lua_load_t)(mod->base + 0x8d68d0);
-    g_orig_luaG_runerror = (luaG_runerror_t)(mod->base + 0x8c7160);
-    g_orig_is_drawing_ready = (is_drawing_ready_t)(mod->base + 0x2176a0);
-    g_orig_image_reader_create = (image_reader_create_t)(mod->base + 0x70fa00);
-    g_orig_detect_format = (detect_format_t)(mod->base + 0x74b160);
+    g_orig_lua_pcall = (lua_pcall_t)ab_hook_resolve(&prof->hk_lua_pcall, mod, mod->base);
+    g_lua_tolstring = (lua_tolstring_t)ab_hook_resolve(&prof->hk_lua_tolstring, mod, mod->base);
+    g_orig_lua_load = (lua_load_t)ab_hook_resolve(&prof->hk_lua_load, mod, mod->base);
+    g_orig_luaG_runerror = (luaG_runerror_t)ab_hook_resolve(&prof->hk_luaG_runerror, mod, mod->base);
+    g_orig_is_drawing_ready = (is_drawing_ready_t)ab_hook_resolve(&prof->hk_is_drawing_ready, mod, mod->base);
+    g_orig_image_reader_create = (image_reader_create_t)ab_hook_resolve(&prof->hk_image_reader_create, mod, mod->base);
+    g_orig_detect_format = (detect_format_t)ab_hook_resolve(&prof->hk_detect_format, mod, mod->base);
 
     funchook_t *funchook = funchook_create();
     if (funchook) {
-        funchook_prepare(funchook, (void**)&g_orig_lua_pcall, (void*)my_lua_pcall);
-        funchook_prepare(funchook, (void**)&g_orig_lua_load, (void*)my_lua_load);
-        funchook_prepare(funchook, (void**)&g_orig_luaG_runerror, (void*)my_luaG_runerror);
-        funchook_prepare(funchook, (void**)&g_orig_is_drawing_ready, (void*)my_is_drawing_ready);
-        funchook_prepare(funchook, (void**)&g_orig_image_reader_create, (void*)my_image_reader_create);
-        funchook_prepare(funchook, (void**)&g_orig_detect_format, (void*)my_detect_format);
+        if (g_orig_lua_pcall)           funchook_prepare(funchook, (void**)&g_orig_lua_pcall, (void*)my_lua_pcall);
+        if (g_orig_lua_load)            funchook_prepare(funchook, (void**)&g_orig_lua_load, (void*)my_lua_load);
+        if (g_orig_luaG_runerror)       funchook_prepare(funchook, (void**)&g_orig_luaG_runerror, (void*)my_luaG_runerror);
+        if (g_orig_is_drawing_ready)    funchook_prepare(funchook, (void**)&g_orig_is_drawing_ready, (void*)my_is_drawing_ready);
+        if (g_orig_image_reader_create) funchook_prepare(funchook, (void**)&g_orig_image_reader_create, (void*)my_image_reader_create);
+        if (g_orig_detect_format)       funchook_prepare(funchook, (void**)&g_orig_detect_format, (void*)my_detect_format);
         int rv = funchook_install(funchook, 0);
         printf("[Hook] In-memory funchook installed (result: %d)\n", rv);
     }
 
-    setup_vfs_bundle_routing(mod);
+    if (prof->has_vfs_bundle_routing)
+        setup_vfs_bundle_routing(mod);
 }
 
-int main(int argc, char* argv[]) {
-    // 0. Crash-dialog mode: our own signal handler re-executes this binary with
-    // --crash-report <file> so the window is drawn by a healthy process.
-    {
-        char report[600] = {0};
-        if (crash_gui_mode(argc, argv, report, sizeof(report))) {
-            if (!report[0]) {
-                fprintf(stderr, "usage: %s --crash-report <file>\n", argv[0]);
-                return 2;
-            }
-            return crash_show_dialog(report);
-        }
-    }
+int ab_run_classic(int argc, char* argv[]) {
+    const ab_game_profile* prof = ab_game_profile_get(AB_GAME_CLASSIC);
+    if (!prof) return 2;
+    (void)argc;   /* the dispatcher already consumed the game-selection flags */
 
     printf("=========================================\n");
     printf("   Angry Birds Desktop (In-Memory x86)   \n");
+    printf("   profile: %-30s\n", prof->name);
     printf("=========================================\n");
 
     // 1. Filesystem & directories
-    fs::create_directories("save");
-    fs::create_directories("save/cache");
-    config_load(CONFIG_NAME);
+    fs::create_directories(prof->save_dir);
+    fs::create_directories(prof->layout_dir);
+    config_load(prof->config_name);
     screen_width = config.width;
     screen_height = config.height;
 
@@ -441,7 +393,7 @@ int main(int argc, char* argv[]) {
     if (config.width == 0) snprintf(res_desc, sizeof(res_desc), "desktop");
     else snprintf(res_desc, sizeof(res_desc), "%dx%d", config.width, config.height);
 
-    crash_init(argv && argv[0] ? argv[0] : nullptr, DATA_DIR);
+    crash_init(argv && argv[0] ? argv[0] : nullptr, prof->save_dir);
     printf("[Config] %s fullscreen=%d vsync=%d scaler=%s renderScale=%d%% "
            "powerups=%s money=%s language=%s\n",
            res_desc, config.fullscreen, config.vsync,
@@ -450,18 +402,29 @@ int main(int argc, char* argv[]) {
 
     // Save-side extras have to land before the engine reads its save (which it
     // does during nativeInit), so do them here, before SDL even starts.
-    powerup_patch_init();
-    store_patch_init();
-    printf("iap: %s\n", config.iap ? "on" : "off");
+    if (prof->has_classic_save_patches) {
+        powerup_patch_init();
+        store_patch_init();
+        printf("iap: %s\n", config.iap ? "on" : "off");
+    }
 
     if (getenv("AB_CRASH_TEST")) crash_test_trigger();
 
-    if (fs::exists("assets")) {
-        AAssetManager_setBasePath("assets");
-    } else if (fs::exists("../assets")) {
-        AAssetManager_setBasePath("../assets");
-    } else {
-        printf("[Warning] 'assets' directory not found in current path!\n");
+    {
+        const char* asset_root = nullptr;
+        for (int i = 0; i < AB_MAX_ASSET_CANDIDATES && prof->asset_candidates[i]; i++) {
+            if (fs::exists(prof->asset_candidates[i])) {
+                asset_root = prof->asset_candidates[i];
+                break;
+            }
+        }
+        if (asset_root) {
+            AAssetManager_setBasePath(asset_root);
+            printf("[Assets] %s root: %s\n", prof->name, asset_root);
+        } else {
+            printf("[Warning] no %s asset directory found (tried '%s')!\n",
+                   prof->name, prof->asset_candidates[0]);
+        }
     }
 
     // 2. Initialize SDL3
@@ -497,7 +460,7 @@ int main(int argc, char* argv[]) {
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
     SDL_Window* window = SDL_CreateWindow(
-        "Angry Birds Classic",
+        prof->display_name,
         screen_width,
         screen_height,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE
@@ -571,23 +534,17 @@ int main(int argc, char* argv[]) {
     void* thiz = jni_make_thiz();
 
     // 5. In-Memory ELF Loading (Unmodified libAngryBirdsClassic.so)
-    const char* lib_paths[] = {
-        "bin/libAngryBirdsClassic.so",
-        "angry-birds-classic-8-0-3/lib/x86/libAngryBirdsClassic.so",
-        "./libAngryBirdsClassic.so",
-        "../bin/libAngryBirdsClassic.so"
-    };
-
     const char* selected_path = nullptr;
-    for (const char* p : lib_paths) {
-        if (fs::exists(p)) {
-            selected_path = p;
+    for (int i = 0; i < AB_MAX_SO_CANDIDATES && prof->so_candidates[i]; i++) {
+        if (fs::exists(prof->so_candidates[i])) {
+            selected_path = prof->so_candidates[i];
             break;
         }
     }
 
     if (!selected_path) {
-        printf("[Error] Could not find libAngryBirdsClassic.so!\n");
+        printf("[Error] Could not find %s (first candidate: %s)\n",
+               prof->display_name, prof->so_candidates[0]);
         SDL_GL_DestroyContext(gl_context);
         SDL_DestroyWindow(window);
         SDL_Quit();
@@ -603,7 +560,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    crash_set_module("libAngryBirdsClassic.so", (uintptr_t)g_game_mod.base, g_game_mod.size);
+    crash_set_module(selected_path, (uintptr_t)g_game_mod.base, g_game_mod.size);
 
     printf("[Loader] Applying internal relocations...\n");
     so_relocate(&g_game_mod);
@@ -614,12 +571,16 @@ int main(int argc, char* argv[]) {
     iap_patch_init(&g_game_mod, config.iap);
 
     printf("[Loader] Resolving dynamic imports...\n");
-    so_resolve(&g_game_mod, g_bionic_dynlib, sizeof(g_bionic_dynlib) / sizeof(g_bionic_dynlib[0]));
+    {
+        size_t dynlib_count = 0;
+        const so_default_dynlib* dynlibs = ab_bionic_dynlib(&dynlib_count);
+        so_resolve(&g_game_mod, dynlibs, (int)dynlib_count);
+    }
 
     printf("[Loader] Running static initializers (.init_array)...\n");
     so_initialize(&g_game_mod);
 
-    if (!resolve_engine_symbols(&g_game_mod)) {
+    if (!resolve_engine_symbols(&g_game_mod, prof)) {
         printf("[Error] Failed to resolve required engine symbols!\n");
         so_free(&g_game_mod);
         SDL_GL_DestroyContext(gl_context);
@@ -628,7 +589,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    install_runtime_hooks(&g_game_mod);
+    install_runtime_hooks(&g_game_mod, prof);
 
     // 6. Register Audio Mixer (AB_AUDIO=0 keeps it silent, e.g. for bisecting
     // a crash that only shows up once the engine's mixer is being driven).
@@ -649,7 +610,7 @@ int main(int argc, char* argv[]) {
 
     if (g_nativeConfig) {
         printf("[Game] Calling nativeConfig...\n");
-        jstring cfg_path = jni_make_string("./save");
+        jstring cfg_path = jni_make_string(prof->data_path);
         g_nativeConfig(fake_env, thiz, cfg_path);
     }
 

@@ -43,3 +43,8 @@ __pycache__/
 angrybirdsclassic_nx-main/
 swordigo-vita-master/
 *.luac
+
+# iOS / archives
+*.ipa
+*.torrent
+save_*/

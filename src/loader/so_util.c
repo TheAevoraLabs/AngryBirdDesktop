@@ -306,13 +306,42 @@ void so_initialize(so_module *mod) {
 
     if (mod->init_array && mod->init_array_size > 0) {
         size_t count = mod->init_array_size / sizeof(uintptr_t);
-        printf("[ELF Loader] Running %zu initializers from DT_INIT_ARRAY...\n", count);
+        printf("[ELF Loader] Running initializers from DT_INIT_ARRAY (%zu slots)...\n", count);
+        /* Two things make a naive walk unsafe here.
+         *
+         * First, the entries are not all constructors. Android toolchains mark
+         * padding with (void*)-1 and glibc uses NULL, and where that marker sits
+         * is not fixed: libAngryBirdsFriends.so has a -1 in slot 0 (with 52 real
+         * constructors after it), while libAngryBirdsClassic.so starts straight
+         * in on real code. So a marker is skipped, never treated as a stop.
+         *
+         * Second, calling whatever happens to be in the slot is how the Friends
+         * bring-up used to jump to 0xffffffff. Only addresses that land inside
+         * the module's own mapping are called; anything else is reported and
+         * skipped, which keeps a malformed table from becoming a fault. */
+        const uintptr_t lo = (uintptr_t)mod->base;
+        const uintptr_t hi = lo + mod->size;
+        size_t ran = 0, skipped = 0;
         for (size_t i = 0; i < count; i++) {
-            void (*ctor)(void) = mod->init_array[i];
-            if (ctor && (uintptr_t)ctor != 0) {
-                ctor();
+            uintptr_t addr = (uintptr_t)mod->init_array[i];
+            if (addr == 0 || addr == (uintptr_t)-1) {
+                skipped++;
+                continue;
             }
+            if (addr < lo || addr >= hi) {
+                printf("[ELF Loader]   init_array[%zu] = %p outside module; skipping\n",
+                       i, (void *)addr);
+                skipped++;
+                continue;
+            }
+            printf("[ELF Loader]   init_array[%zu] = %p\n", i, (void *)addr);
+            fflush(stdout);
+            ((void (*)(void))addr)();
+            ran++;
         }
+        printf("[ELF Loader] Ran %zu initializer(s), skipped %zu padding/foreign slot(s).\n",
+               ran, skipped);
+        fflush(stdout);
     }
     printf("[ELF Loader] Initializers completed successfully.\n");
 }
