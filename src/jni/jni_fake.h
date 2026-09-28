@@ -40,6 +40,9 @@ void jni_init(void);
 // the fake activity instance / class handed to the JNI entry points
 void *jni_make_thiz(void);
 
+// read a fake string object back as a C string (NULL if it is not a string)
+const char *jni_obj_string(void *obj);
+
 // fake Java object constructors used by main.c when driving the lifecycle
 jstring jni_make_string(const char *utf);
 jclass  jni_find_class_c(const char *name);   // same as env FindClass, for C use

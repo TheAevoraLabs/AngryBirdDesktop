@@ -37,6 +37,7 @@
 #include "jni.h"
 #include "jni_fake.h"
 #include "fusion.h"
+#include "patches/iap_patch.h"
 #include "common/game_config.h"
 #include "common/util.h"
 
@@ -173,6 +174,10 @@ jvalue fusion_call(const char *cls, const char *method, const char *sig,
                    void *self, va_list ap) {
   (void)self;
   jvalue r; r.j = 0;
+
+  // Billing first: the fake store answers every Google Play call itself (and
+  // replies asynchronously from iap_patch_poll, not from inside this call).
+  if (iap_handles_java_call(cls, method, sig, ap)) return r;
 
   // -------- AudioOutput --------
   if (IS("createAudioOutput")) {

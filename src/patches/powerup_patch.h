@@ -2,6 +2,10 @@
 #define POWERUP_PATCH_H
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Called once at boot, after config load and set_asset_base(), before the
 // engine starts. If config "powerups" is "max" or a number, tops every
 // power-up in the save (<game dir>/settings.lua) up to that many available
@@ -16,4 +20,9 @@ int powerups_target_from_config(const char *value);
 // (*changed = 0) or the text isn't in the layout the game writes (*changed = -1).
 char *powerups_edit_save_text(const char *in, size_t len, int target,
                               size_t *out_len, int *changed);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif

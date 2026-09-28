@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +21,12 @@
 #include "jni/jni_fake.h"
 #include "fusion/fusion.h"
 #include "audio/audio.h"
+#include "input/input.h"
+#include "render/present.h"
+#include "crash/crash.h"
+#include "patches/powerup_patch.h"
+#include "patches/store_patch.h"
+#include "patches/iap_patch.h"
 #include "common/game_config.h"
 #include "common/util.h"
 #include "android/asset_manager.h"
@@ -37,10 +45,22 @@ typedef void (*nativeDeinit_t)(JNIEnv env, jobject thiz);
 typedef void (*nativePause_t)(JNIEnv env, jobject thiz);
 typedef void (*nativeResume_t)(JNIEnv env, jobject thiz);
 typedef void (*nativeResize_t)(JNIEnv env, jobject thiz, jint width, jint height);
-typedef void (*nativeUpdate_t)(JNIEnv env, jobject thiz);
-typedef void (*nativeRender_t)(JNIEnv env, jobject thiz);
-typedef void (*nativeInput_t)(JNIEnv env, jobject thiz, jint action, jint pointerId, jfloat x, jfloat y);
-typedef void (*nativeKeyInput_t)(JNIEnv env, jobject thiz, jint keycode, jint action);
+/* nativeUpdate()Z -- the Java layer treats a false return as "the engine is
+ * finished", tears the GL surface down and calls nativeDeinit. Ignoring the
+ * return value means we keep driving an engine that has already begun shutting
+ * its own threads down, which is exactly how a clean window close turns into a
+ * crash. */
+typedef jboolean (*nativeUpdate_t)(JNIEnv env, jobject thiz);
+typedef jboolean (*nativeRender_t)(JNIEnv env, jobject thiz);
+/* Argument order matters on x86-32: Fusion's Java layer declares
+ *   nativeInput(int action, float x, float y, int pointerId)
+ *   nativeKeyInput(int keyCode, int action, int unicodeChar, int deviceId)
+ * (the AArch64 Switch port could be sloppy about this and still work, because
+ * ints and floats travel in different register banks there -- cdecl has no such
+ * luxury, so the order below is taken straight from the engine's prologues). */
+typedef void (*nativeInput_t)(JNIEnv env, jobject thiz, jint action, jfloat x, jfloat y, jint pointerId);
+typedef void (*nativeKeyInput_t)(JNIEnv env, jobject thiz, jint keyCode, jint action, jint unicodeChar, jint deviceId);
+typedef void (*nativeInputAxis_t)(JNIEnv env, jobject thiz, jint axis, jfloat value, jint deviceId);
 
 static JNI_OnLoad_t g_JNI_OnLoad = nullptr;
 static nativeConfig_t g_nativeConfig = nullptr;
@@ -53,6 +73,7 @@ static nativeUpdate_t g_nativeUpdate = nullptr;
 static nativeRender_t g_nativeRender = nullptr;
 static nativeInput_t g_nativeInput = nullptr;
 static nativeKeyInput_t g_nativeKeyInput = nullptr;
+static nativeInputAxis_t g_nativeInputAxis = nullptr;
 static void* g_nativeMixData_addr = nullptr;
 
 // External Bionic symbols from bionic_shims.c
@@ -64,6 +85,16 @@ extern "C" {
     extern void* memalign(size_t alignment, size_t size);
     extern size_t malloc_usable_size(void* ptr);
     extern ssize_t __read_chk(int fd, void *buf, size_t count, size_t buflen);
+
+    // Bionic's LP32 `struct sigaction` is 16 bytes (its sigset_t is one word),
+    // glibc's is 140. The engine allocates the Bionic-sized struct on its stack
+    // and hands the address to sigaction(), so calling glibc's directly walks
+    // ~124 bytes past the end of that stack slot. These wrappers convert the
+    // layouts; they are deliberately not named `sigaction`/`sigprocmask` so the
+    // host libraries keep calling the real ones.
+    struct bionic_sigaction;
+    extern int rovio_sigaction_compat(int signum, const struct bionic_sigaction* act, struct bionic_sigaction* oldact);
+    extern int rovio_sigprocmask_compat(int how, const unsigned long* set, unsigned long* oldset);
 }
 
 static const so_default_dynlib g_bionic_dynlib[] = {
@@ -94,6 +125,8 @@ static const so_default_dynlib g_bionic_dynlib[] = {
     { "memalign", (uintptr_t)memalign },
     { "malloc_usable_size", (uintptr_t)malloc_usable_size },
     { "__read_chk", (uintptr_t)__read_chk },
+    { "sigaction", (uintptr_t)rovio_sigaction_compat },
+    { "sigprocmask", (uintptr_t)rovio_sigprocmask_compat },
 };
 
 static bool resolve_engine_symbols(so_module* mod) {
@@ -108,12 +141,32 @@ static bool resolve_engine_symbols(so_module* mod) {
     g_nativeRender = (nativeRender_t)so_symbol(mod, "Java_com_rovio_fusion_NativeApplication_nativeRender");
     g_nativeInput = (nativeInput_t)so_symbol(mod, "Java_com_rovio_fusion_MyInputHandler_nativeInput");
     g_nativeKeyInput = (nativeKeyInput_t)so_symbol(mod, "Java_com_rovio_fusion_MyInputHandler_nativeKeyInput");
-    g_nativeMixData_addr = (void*)so_symbol(mod, "Java_com_rovio_fusion_Audio_nativeMixData");
+    g_nativeInputAxis = (nativeInputAxis_t)so_symbol(mod, "Java_com_rovio_fusion_MyInputHandler_nativeInputAxis");
+    // The exported mixer lives on AudioOutput, not on an "Audio" class: see
+    // `nm -D libAngryBirdsClassic.so | grep nativeMixData`.
+    g_nativeMixData_addr = (void*)so_symbol(mod, "Java_com_rovio_fusion_AudioOutput_nativeMixData");
+    if (!g_nativeMixData_addr)
+        g_nativeMixData_addr = (void*)so_symbol(mod, "Java_com_rovio_fusion_Audio_nativeMixData");
+
+    printf("[Engine] Resolved native entry points:\n");
+    printf("  JNI_OnLoad:     %p\n", (void*)g_JNI_OnLoad);
+    printf("  nativeConfig:   %p\n", (void*)g_nativeConfig);
+    printf("  nativeInit:     %p\n", (void*)g_nativeInit);
+    printf("  nativeResize:   %p\n", (void*)g_nativeResize);
+    printf("  nativeUpdate:   %p\n", (void*)g_nativeUpdate);
+    printf("  nativeInput:    %p\n", (void*)g_nativeInput);
+    printf("  nativeKeyInput: %p\n", (void*)g_nativeKeyInput);
+    printf("  nativeMixData:  %p\n", g_nativeMixData_addr);
+    fflush(stdout);
 
     if (!g_nativeInit || !g_nativeUpdate) {
         printf("[Error] Missing core symbols in game SO!\n");
         return false;
     }
+    if (!g_nativeInput)
+        printf("[Warning] nativeInput missing -- pointer input will be dead.\n");
+    if (!g_nativeMixData_addr)
+        printf("[Warning] nativeMixData missing -- the mixer cannot be registered.\n");
     return true;
 }
 
@@ -360,8 +413,18 @@ static void install_runtime_hooks(so_module* mod) {
 }
 
 int main(int argc, char* argv[]) {
-    (void)argc;
-    (void)argv;
+    // 0. Crash-dialog mode: our own signal handler re-executes this binary with
+    // --crash-report <file> so the window is drawn by a healthy process.
+    {
+        char report[600] = {0};
+        if (crash_gui_mode(argc, argv, report, sizeof(report))) {
+            if (!report[0]) {
+                fprintf(stderr, "usage: %s --crash-report <file>\n", argv[0]);
+                return 2;
+            }
+            return crash_show_dialog(report);
+        }
+    }
 
     printf("=========================================\n");
     printf("   Angry Birds Desktop (In-Memory x86)   \n");
@@ -370,7 +433,28 @@ int main(int argc, char* argv[]) {
     // 1. Filesystem & directories
     fs::create_directories("save");
     fs::create_directories("save/cache");
-    config_load_defaults();
+    config_load(CONFIG_NAME);
+    screen_width = config.width;
+    screen_height = config.height;
+
+    char res_desc[32];
+    if (config.width == 0) snprintf(res_desc, sizeof(res_desc), "desktop");
+    else snprintf(res_desc, sizeof(res_desc), "%dx%d", config.width, config.height);
+
+    crash_init(argv && argv[0] ? argv[0] : nullptr, DATA_DIR);
+    printf("[Config] %s fullscreen=%d vsync=%d scaler=%s renderScale=%d%% "
+           "powerups=%s money=%s language=%s\n",
+           res_desc, config.fullscreen, config.vsync,
+           config.scaler, config.render_scale, config.powerups, config.money,
+           config.language);
+
+    // Save-side extras have to land before the engine reads its save (which it
+    // does during nativeInit), so do them here, before SDL even starts.
+    powerup_patch_init();
+    store_patch_init();
+    printf("iap: %s\n", config.iap ? "on" : "off");
+
+    if (getenv("AB_CRASH_TEST")) crash_test_trigger();
 
     if (fs::exists("assets")) {
         AAssetManager_setBasePath("assets");
@@ -384,6 +468,25 @@ int main(int argc, char* argv[]) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS)) {
         printf("[SDL3] Failed to initialize SDL: %s\n", SDL_GetError());
         return 1;
+    }
+
+    if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+        printf("[SDL3] Gamepad subsystem unavailable (%s)\n", SDL_GetError());
+    }
+
+    // `width 0` / `height 0` (the default) means "the monitor's resolution".
+    // Fusion lays its UI out from the size we hand it, so booting at the
+    // panel's native size is the sharpest option without a scaler.
+    if (screen_width <= 0 || screen_height <= 0) {
+        const SDL_DisplayMode *dm = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
+        if (dm && dm->w > 0 && dm->h > 0) {
+            if (screen_width <= 0) screen_width = dm->w;
+            if (screen_height <= 0) screen_height = dm->h;
+        } else {
+            if (screen_width <= 0) screen_width = 1280;
+            if (screen_height <= 0) screen_height = 720;
+        }
+        printf("[SDL3] desktop resolution %dx%d\n", screen_width, screen_height);
     }
 
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
@@ -406,6 +509,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // SDL3's plain fullscreen is desktop/borderless, which is what a game like
+    // this wants (no mode switch, no flicker). F11 / Alt+Enter toggles it.
+    bool fullscreen = config.fullscreen != 0;
+    if (fullscreen) SDL_SetWindowFullscreen(window, true);
+
     SDL_GLContext gl_context = SDL_GL_CreateContext(window);
     if (!gl_context) {
         printf("[SDL3] Failed to create OpenGL context: %s\n", SDL_GetError());
@@ -414,13 +522,55 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    SDL_GL_SetSwapInterval(1); // Enable VSync
+    if (!SDL_GL_MakeCurrent(window, gl_context)) {
+        printf("[SDL3] Failed to make OpenGL context current: %s\n", SDL_GetError());
+        SDL_GL_DestroyContext(gl_context);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
 
-    // 3. Initialize Fake JNI Environment
+    SDL_GL_SetSwapInterval(config.vsync ? 1 : 0);
+
+    // The engine and the window can now differ: with a scaler other than
+    // "native" the engine renders at renderScale% of the window and we upscale.
+    PresentConfig pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.scaler = present_scaler_from_name(config.scaler);
+    pcfg.render_scale = config.render_scale;
+    pcfg.window_w = screen_width;
+    pcfg.window_h = screen_height;
+    present_init(&pcfg);
+
+    int win_w = screen_width, win_h = screen_height;
+    screen_width = present_render_w();
+    screen_height = present_render_h();
+
+    // 3. Input front-end (mouse + multi-touch + keyboard -> Fusion nativeInput).
+    // Mode is overridable for testing: AB_INPUT=mouse|touch|auto, AB_HOVER=0|1.
+    AbInputConfig icfg;
+    memset(&icfg, 0, sizeof(icfg));
+    icfg.render_w = screen_width;
+    icfg.render_h = screen_height;
+    icfg.window_w = win_w;
+    icfg.window_h = win_h;
+    icfg.mode = AB_INPUT_AUTO;
+    icfg.mouse_hover = 1;
+    icfg.mouse_pointer_id = 0;
+    icfg.keyboard = 1;
+    icfg.max_pointers = 8;
+    if (const char* m = getenv("AB_INPUT")) {
+        if (!strcmp(m, "mouse")) icfg.mode = AB_INPUT_MOUSE;
+        else if (!strcmp(m, "touch")) icfg.mode = AB_INPUT_TOUCH;
+    }
+    if (const char* h = getenv("AB_HOVER")) icfg.mouse_hover = (h[0] != '0');
+    ab_input_init(&icfg);
+
+    // 4. Initialize Fake JNI Environment
     jni_init();
     void* thiz = jni_make_thiz();
 
-    // 4. In-Memory ELF Loading (Unmodified libAngryBirdsClassic.so)
+    // 5. In-Memory ELF Loading (Unmodified libAngryBirdsClassic.so)
     const char* lib_paths[] = {
         "bin/libAngryBirdsClassic.so",
         "angry-birds-classic-8-0-3/lib/x86/libAngryBirdsClassic.so",
@@ -453,8 +603,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    crash_set_module("libAngryBirdsClassic.so", (uintptr_t)g_game_mod.base, g_game_mod.size);
+
     printf("[Loader] Applying internal relocations...\n");
     so_relocate(&g_game_mod);
+
+    // The shop talks to Google Play through Java we do not have; this stands in
+    // for it so a purchase tap actually completes. Needs the relocated module
+    // (it calls the engine's own paymentFinished/restoreDone exports).
+    iap_patch_init(&g_game_mod, config.iap);
 
     printf("[Loader] Resolving dynamic imports...\n");
     so_resolve(&g_game_mod, g_bionic_dynlib, sizeof(g_bionic_dynlib) / sizeof(g_bionic_dynlib[0]));
@@ -473,12 +630,18 @@ int main(int argc, char* argv[]) {
 
     install_runtime_hooks(&g_game_mod);
 
-    // 5. Register Audio Mixer
+    // 6. Register Audio Mixer (AB_AUDIO=0 keeps it silent, e.g. for bisecting
+    // a crash that only shows up once the engine's mixer is being driven).
     if (g_nativeMixData_addr) {
-        audio_set_mixer(g_nativeMixData_addr, thiz);
+        const char* audio_env = getenv("AB_AUDIO");
+        if (audio_env && audio_env[0] == '0') {
+            printf("[Audio] disabled by AB_AUDIO=0\n");
+        } else {
+            audio_set_mixer(g_nativeMixData_addr, thiz);
+        }
     }
 
-    // 6. JNI OnLoad & Native Configuration
+    // 7. JNI OnLoad & Native Configuration
     if (g_JNI_OnLoad) {
         printf("[Game] Calling JNI_OnLoad...\n");
         g_JNI_OnLoad(fake_vm, nullptr);
@@ -490,7 +653,8 @@ int main(int argc, char* argv[]) {
         g_nativeConfig(fake_env, thiz, cfg_path);
     }
 
-    printf("[Game] Initializing engine with resolution %dx%d...\n", screen_width, screen_height);
+    printf("[Game] Initializing engine with resolution %dx%d (window %dx%d)...\n",
+           screen_width, screen_height, win_w, win_h);
     if (g_nativeInit) {
         g_nativeInit(fake_env, thiz, screen_width, screen_height);
     }
@@ -507,11 +671,33 @@ int main(int argc, char* argv[]) {
         printf("[Game] nativeResume completed successfully!\n");
     }
 
-    // 7. Main Application Loop
+    // 8. Main Application Loop
     bool running = true;
-    bool mouse_down = false;
     SDL_Event event;
     uint64_t frame_count = 0;
+
+    /* Self-test hooks, so a headless-ish harness can exercise things that would
+     * otherwise need a human at the mouse:
+     *   AB_AUTOCLOSE=<frames>       quit through the real window-close path
+     *   AB_SCREENSHOT=<file.bmp>    save one frame right before it is swapped
+     *   AB_SCREENSHOT_FRAME=<n>     which frame to save (default 600) */
+    const char *shot_path = getenv("AB_SCREENSHOT");
+    long shot_frame = 600;
+    if (const char *s = getenv("AB_SCREENSHOT_FRAME")) {
+        long v = atol(s);
+        if (v > 0) shot_frame = v;
+    }
+    long autoclose = 0;
+    if (const char *s = getenv("AB_AUTOCLOSE")) {
+        autoclose = atol(s);
+        if (autoclose < 1) autoclose = 1;
+    }
+    const char *fake_purchase = getenv("AB_FAKE_PURCHASE");
+    long fake_purchase_frame = 240;
+    if (const char *s = getenv("AB_FAKE_PURCHASE_FRAME")) {
+        long v = atol(s);
+        if (v > 0) fake_purchase_frame = v;
+    }
 
     printf("[Game] Entering main render loop...\n");
     fflush(stdout);
@@ -519,86 +705,133 @@ int main(int argc, char* argv[]) {
     while (running && !jni_quit_requested) {
         uint64_t start_time = SDL_GetTicks();
 
-        // Poll Events
+        // Poll Events. App-level keys are handled here; everything else is
+        // handed to the input module, which translates it into engine events.
         while (SDL_PollEvent(&event)) {
-            switch (event.type) {
-                case SDL_EVENT_QUIT:
-                    printf("[Game] Received SDL_EVENT_QUIT\n");
-                    running = false;
-                    break;
+            if (event.type == SDL_EVENT_QUIT) {
+                printf("[Game] Received SDL_EVENT_QUIT\n");
+                running = false;
+                continue;
+            }
 
-                case SDL_EVENT_WINDOW_RESIZED: {
-                    int new_w = event.window.data1;
-                    int new_h = event.window.data2;
-                    if (new_w > 0 && new_h > 0) {
-                        screen_width = new_w;
-                        screen_height = new_h;
-                        if (g_nativeResize) {
-                            g_nativeResize(fake_env, thiz, new_w, new_h);
-                        }
+            if (event.type == SDL_EVENT_KEY_DOWN &&
+                (event.key.key == SDLK_ESCAPE || event.key.key == SDLK_Q)) {
+                printf("[Game] ESC/Q pressed, exiting...\n");
+                running = false;
+                continue;
+            }
+
+            if (event.type == SDL_EVENT_KEY_DOWN &&
+                (event.key.key == SDLK_F11 ||
+                 (event.key.key == SDLK_RETURN && (event.key.mod & SDL_KMOD_ALT)))) {
+                fullscreen = !fullscreen;
+                SDL_SetWindowFullscreen(window, fullscreen);
+                SDL_GL_MakeCurrent(window, gl_context);
+                printf("[Game] fullscreen %s\n", fullscreen ? "on" : "off");
+                continue;
+            }
+
+            if (event.type == SDL_EVENT_WINDOW_RESIZED ||
+                event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
+                int new_w = event.window.data1;
+                int new_h = event.window.data2;
+                if (new_w > 0 && new_h > 0) {
+                    win_w = new_w;
+                    win_h = new_h;
+                    SDL_GL_MakeCurrent(window, gl_context);
+                    present_set_window(new_w, new_h);
+                    screen_width = present_render_w();
+                    screen_height = present_render_h();
+                    ab_input_resize(new_w, new_h);
+                    ab_input_set_render_size(screen_width, screen_height);
+                    if (g_nativeResize) {
+                        g_nativeResize(fake_env, thiz, screen_width, screen_height);
                     }
-                    break;
                 }
+                continue;
+            }
 
-                case SDL_EVENT_MOUSE_BUTTON_DOWN: {
-                    if (event.button.button == SDL_BUTTON_LEFT) {
-                        mouse_down = true;
-                        float x = event.button.x;
-                        float y = event.button.y;
-                        if (g_nativeInput) {
-                            g_nativeInput(fake_env, thiz, 0 /* ACTION_DOWN */, 0, x, y);
-                        }
-                    }
-                    break;
-                }
+            ab_input_handle(&event);
+        }
 
-                case SDL_EVENT_MOUSE_BUTTON_UP: {
-                    if (event.button.button == SDL_BUTTON_LEFT) {
-                        mouse_down = false;
-                        float x = event.button.x;
-                        float y = event.button.y;
-                        if (g_nativeInput) {
-                            g_nativeInput(fake_env, thiz, 1 /* ACTION_UP */, 0, x, y);
-                        }
-                    }
-                    break;
-                }
-
-                case SDL_EVENT_MOUSE_MOTION: {
-                    if (mouse_down) {
-                        float x = event.motion.x;
-                        float y = event.motion.y;
-                        if (g_nativeInput) {
-                            g_nativeInput(fake_env, thiz, 2 /* ACTION_MOVE */, 0, x, y);
-                        }
-                    }
-                    break;
-                }
-
-                case SDL_EVENT_KEY_DOWN: {
-                    if (event.key.key == SDLK_ESCAPE) {
-                        printf("[Game] ESC pressed, exiting...\n");
-                        running = false;
-                    }
-                    break;
-                }
-
-                default:
-                    break;
+        // Forward this frame's pointer/key events to the engine.
+        AbInputEvent ievs[64];
+        int nev = ab_input_poll(ievs, 64);
+        if (frame_count < 25 && nev) {
+            printf("[Game] frame %lu delivered %d input event(s) (type0=%d act0=%d id0=%d)\n",
+                   (unsigned long)frame_count + 1, nev,
+                   (int)ievs[0].type, (int)ievs[0].action, (int)ievs[0].pointer_id);
+            fflush(stdout);
+        }
+        for (int i = 0; i < nev; i++) {
+            const AbInputEvent* ie = &ievs[i];
+            if (ie->type == AB_EV_POINTER) {
+                if (g_nativeInput)
+                    g_nativeInput(fake_env, thiz, ie->action, ie->x, ie->y, ie->pointer_id);
+            } else if (ie->type == AB_EV_KEY && g_nativeKeyInput) {
+                g_nativeKeyInput(fake_env, thiz, ie->keycode, ie->action, ie->unicode, ie->device_id);
             }
         }
 
         // Poll & Queue Audio
         audio_poll();
 
-        // Game Logic & Frame Rendering (Fusion engine renders inside nativeUpdate)
+        // Deliver any fake-billing callback whose "network round trip" is done.
+        iap_patch_poll();
+
+        // Game Logic & Frame Rendering (Fusion renders inside nativeUpdate).
+        // In a scaled mode the whole frame goes into our offscreen target.
+        present_begin();
+
+        bool engine_alive = true;
         if (g_nativeUpdate) {
-            g_nativeUpdate(fake_env, thiz);
+            jboolean alive = g_nativeUpdate(fake_env, thiz);
+            engine_alive = alive != 0;
+
+            /* The engine returns false from its very first update in this host:
+             * the lifecycle/state it reads lives on the Java side (NativeState
+             * lives in NativeApplication.java, which we do not have), so a bare
+             * false is not a shutdown request here. Treat it as one only after
+             * the engine has reported true at least once -- true -> false is a
+             * real "I was running and I am stopping now". ESC/Q, F11 and the
+             * window's own close button remain the reliable ways out, and the
+             * engine's own quit path still works once it ever reports true. */
+            static int engine_reported_true = 0;
+            if (alive) engine_reported_true = 1;
+            else if (!engine_reported_true && !engine_alive) {
+                static int notice = 0;
+                if (!notice) {
+                    notice = 1;
+                    printf("[Game] nativeUpdate reports false; staying up until the engine "
+                           "has reported true at least once (ESC/Q closes)\n");
+                    fflush(stdout);
+                }
+                engine_alive = true;
+            }
+
+            static int last_reported = -1;
+            if ((int)alive != last_reported) {
+                printf("[Game] nativeUpdate frame %lu -> %d%s\n",
+                       (unsigned long)frame_count + 1, (int)alive,
+                       engine_alive ? "" : " (false)");
+                fflush(stdout);
+                last_reported = (int)alive;
+            }
+        }
+        if (engine_alive && g_nativeRender) {
+            jboolean drew = g_nativeRender(fake_env, thiz);
+            static int last_drew = -1;
+            if ((int)drew != last_drew) {
+                printf("[Game] nativeRender frame %lu -> %d\n",
+                       (unsigned long)frame_count + 1, (int)drew);
+                fflush(stdout);
+                last_drew = (int)drew;
+            }
         }
 
-        if (g_nativeRender) {
-            g_nativeRender(fake_env, thiz);
-        }
+        present_end();
+
+        if (shot_path && (long)frame_count == shot_frame) present_capture(shot_path);
 
         // Present OpenGL frame
         SDL_GL_SwapWindow(window);
@@ -609,6 +842,26 @@ int main(int argc, char* argv[]) {
             fflush(stdout);
         }
 
+        if (!engine_alive) {
+            printf("[Game] Engine signalled exit (nativeUpdate returned false)\n");
+            fflush(stdout);
+            running = false;
+        }
+
+        if (fake_purchase && (long)frame_count == fake_purchase_frame) {
+            iap_patch_request(strcmp(fake_purchase, "1") ? fake_purchase : nullptr);
+        }
+
+        if (autoclose && (long)frame_count >= autoclose && running) {
+            printf("[Game] AB_AUTOCLOSE: closing the window after %ld frames\n",
+                   (long)frame_count);
+            fflush(stdout);
+            SDL_Event quit;
+            SDL_zero(quit);
+            quit.type = SDL_EVENT_QUIT;
+            SDL_PushEvent(&quit);
+        }
+
         // Cap to ~60 FPS
         uint64_t elapsed = SDL_GetTicks() - start_time;
         if (elapsed < 16) {
@@ -616,7 +869,16 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    printf("[Game] Exiting application cleanly...\n");
+    printf("[Game] Exiting application cleanly (audio mixes: %lu, bytes: %lu)...\n",
+           audio_mix_calls(), audio_bytes_mixed());
+    fflush(stdout);
+
+    ab_input_shutdown();
+
+    /* Teardown order matters. The mixer runs on SDL's audio thread and calls
+     * straight into the engine, so it has to be stopped BEFORE the engine starts
+     * dismantling itself -- otherwise a mix lands in a half-freed mixer. */
+    audio_shutdown();
 
     if (g_nativePause) {
         g_nativePause(fake_env, thiz);
@@ -626,13 +888,13 @@ int main(int argc, char* argv[]) {
         g_nativeDeinit(fake_env, thiz);
     }
 
-    audio_shutdown();
-    so_free(&g_game_mod);
-
-    SDL_GL_DestroyContext(gl_context);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
-
+    /* The engine keeps its own worker threads and has finished writing its save
+     * by now. Tearing down EGL/SDL underneath those threads, and unmapping the
+     * module out from under their code, is what used to turn "close the window"
+     * into a crash -- so hand the process straight back to the kernel instead.
+     * _exit() skips atexit handlers and every one of those teardown races. */
     printf("[Game] Application terminated cleanly.\n");
-    return 0;
+    fflush(stdout);
+    fflush(stderr);
+    _exit(0);
 }

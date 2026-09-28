@@ -21,6 +21,7 @@
 
 #include "jni.h"
 #include "jni_fake.h"
+#include "patches/iap_patch.h"
 #include "common/util.h"
 #include "fusion/fusion.h"
 
@@ -252,17 +253,49 @@ static jobject jf_AllocObject(JNIEnv e, jclass c) { (void)e;(void)c; return obj_
 // a generic instance; any methods later called on it route through the catch-all.
 //
 // Special case: the engine builds its Java AudioOutput by passing the native
-// mixer pointer to the constructor; that pointer is exactly what nativeMixData
-// needs back as its "peer". Capture it here. A real Switch pointer is a large
-// value, so we ignore small ctor args (sample rate, channel count, ...).
+// mixer pointer to the constructor;
+//
+//   new com.rovio.fusion.AudioOutput(jlong peer, int rate, int channels,
+//                                    int bits, int bytesPerBuffer)
+//
+// and that first argument is exactly the pointer nativeMixData needs back as
+// its "peer". Capture it here. We must not confuse it with the small int args
+// that follow (sample rate, channel count, ...), so the value has to look like
+// a real pointer.
+//
+// On i386 a jlong is two 32-bit stack words. GCC stacks an 8-byte argument at
+// 4-byte alignment (peer low word first) while some toolchains pad to 8, so we
+// inspect both words and take whichever looks like a heap pointer.
+static int take_audio_peer(va_list ap, uintptr_t *out) {
+#if defined(__i386__) || defined(_M_IX86)
+  const uint32_t *w = (const uint32_t *)(ap);
+  for (int i = 0; i < 2; i++) {
+    uint32_t v = w[i];
+    if ((v & 3u) == 0 && v >= 0x10000u && v != 0xffffffffu) { *out = (uintptr_t)v; return 1; }
+  }
+  return 0;
+#else
+  unsigned long long v = va_arg(ap, unsigned long long);
+  if (!v) return 0;
+  *out = (uintptr_t)v;
+  return 1;
+#endif
+}
+
 static jobject new_object_common(jclass c, va_list ap) {
   FakeObj *cl = c;
   const char *cn = (cl && cl->tag == T_CLASS) ? cl->cls : "?";
   if (cl && cl->tag == T_CLASS && strstr(cl->cls, "AudioOutput")) {
-    unsigned long a0 = (unsigned long)va_arg(ap, unsigned long);
-    debugPrintf("NewObject(%s) arg0=%#lx\n", cn, a0);
-    if (a0 > 0x100000UL && a0 < 0x8000000000UL)   // plausible pointer, not an int arg
-      fusion_set_audio_peer((void *)(uintptr_t)a0);
+    uintptr_t peer = 0;
+    if (take_audio_peer(ap, &peer)) {
+      debugPrintf("JNI NewObject(%s) native peer = %p\n", cn, (void *)peer);
+      fusion_set_audio_peer((void *)peer);
+    } else {
+      debugPrintf("JNI NewObject(%s): no plausible peer pointer in ctor args\n", cn);
+    }
+  } else if (cl && cl->tag == T_CLASS && iap_patch_ctor(cl->cls, ap)) {
+    /* the billing provider's ctor carries the native handle its callbacks need;
+     * iap_patch took it (and logs). */
   } else {
     debugPrintf("NewObject(%s)\n", cn);
   }
@@ -280,10 +313,9 @@ static jobject jf_NewObjectA(JNIEnv e, jclass c, jmethodID m, void *av) {
   FakeObj *cl = c;
   const char *cn = (cl && cl->tag == T_CLASS) ? cl->cls : "?";
   if (cl && cl->tag == T_CLASS && strstr(cl->cls, "AudioOutput") && av) {
-    unsigned long a0 = *(unsigned long *)av;  // jvalue[0]
-    debugPrintf("NewObjectA(%s) arg0=%#lx\n", cn, a0);
-    if (a0 > 0x100000UL && a0 < 0x8000000000UL)
-      fusion_set_audio_peer((void *)(uintptr_t)a0);
+    uintptr_t peer = (uintptr_t)(*(uint64_t *)av);   // jvalue[0].j, low word on i386
+    debugPrintf("JNI NewObjectA(%s) native peer = %p\n", cn, (void *)peer);
+    if (peer) fusion_set_audio_peer((void *)peer);
   }
   return obj_new(T_GENERIC);
 }
@@ -480,6 +512,15 @@ void jni_init(void) {
 void *jni_make_thiz(void) {
   // a generic non-NULL object to stand in for the Activity/Renderer instance
   return obj_new(T_GENERIC);
+}
+
+// Read a fake string object back as a C string (NULL when the object is not one
+// of our T_STRING stand-ins). Used by the billing bridge to recover the sku the
+// engine passes to the Java provider.
+const char *jni_obj_string(void *o) {
+  FakeObj *f = o;
+  if (!f || f->tag != T_STRING || !f->str) return NULL;
+  return f->str;
 }
 
 jstring jni_make_string(const char *utf) { return jf_NewStringUTF(fake_env, utf); }

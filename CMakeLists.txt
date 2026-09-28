@@ -34,6 +34,9 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/src/common
     ${CMAKE_SOURCE_DIR}/src/patches
     ${CMAKE_SOURCE_DIR}/src/audio
+    ${CMAKE_SOURCE_DIR}/src/input
+    ${CMAKE_SOURCE_DIR}/src/render
+    ${CMAKE_SOURCE_DIR}/src/crash
     ${CMAKE_SOURCE_DIR}/funchook-1.1.3/include
 )
 
@@ -60,11 +63,16 @@ set(SOURCES
     src/patches/patch_bytecode.c
     src/patches/sprite_patch.c
     src/patches/powerup_patch.c
+    src/patches/store_patch.c
+    src/patches/iap_patch.c
     src/patches/aes.c
     src/android/bionic_shims.c
     src/android/asset_manager.c
     src/android/log.c
     src/audio/audio.cpp
+    src/input/input.cpp
+    src/render/present.c
+    src/crash/crash.c
 )
 
 add_executable(angrybirds_desktop ${SOURCES})
